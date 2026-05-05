@@ -1,7 +1,7 @@
 // 全局变量
 let currentSessionId = localStorage.getItem('chat_session_id');
 let isLoading = false;
-let currentStreamController = null; // 用于中断请求（可选）
+let currentStreamController = null;
 
 function generateUUID() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
@@ -24,6 +24,7 @@ const messagesArea = document.getElementById('messagesArea');
 const userInput = document.getElementById('userInput');
 const sendBtn = document.getElementById('sendBtn');
 const newChatBtn = document.getElementById('newChatBtn');
+const modelSelect = document.getElementById('modelSelect');
 
 // 配置 marked
 if (typeof marked !== 'undefined') {
@@ -54,16 +55,14 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-// 添加或更新最后的 assistant 消息（用于流式更新）
 let lastAssistantMessageDiv = null;
 
 function appendOrUpdateAssistantMessage(contentChunk, isComplete = false) {
     if (!lastAssistantMessageDiv) {
-        // 创建新消息
         const messageDiv = document.createElement('div');
         messageDiv.className = 'message assistant';
         messageDiv.innerHTML = `
-            <div class="avatar">🤖</div>
+            <div class="avatar">A</div>
             <div class="message-content">
                 <div class="bubble"></div>
                 <div class="timestamp">${new Date().toLocaleTimeString()}</div>
@@ -73,30 +72,26 @@ function appendOrUpdateAssistantMessage(contentChunk, isComplete = false) {
         lastAssistantMessageDiv = messageDiv;
     }
     const bubbleDiv = lastAssistantMessageDiv.querySelector('.bubble');
-    // 累积内容
     let currentText = bubbleDiv.getAttribute('data-full-text') || '';
     if (!isComplete) {
         currentText += contentChunk;
         bubbleDiv.setAttribute('data-full-text', currentText);
-        // 实时渲染 Markdown
         bubbleDiv.innerHTML = renderMarkdown(currentText);
     } else {
-        // 最终完整内容
-        currentText = contentChunk; // 用完整文本覆盖
+        currentText = contentChunk;
         bubbleDiv.innerHTML = renderMarkdown(currentText);
-        lastAssistantMessageDiv = null; // 重置，下次新消息重新创建
+        lastAssistantMessageDiv = null;
     }
     scrollToBottom();
 }
 
 function appendMessage(role, content, timestamp = null) {
     if (role === 'assistant' && lastAssistantMessageDiv) {
-        // 如果有未完成的流式消息，先结束它（正常情况下不会发生）
         lastAssistantMessageDiv = null;
     }
     const messageDiv = document.createElement('div');
     messageDiv.className = `message ${role}`;
-    const avatar = role === 'user' ? '👤' : '🤖';
+    const avatarText = role === 'user' ? 'U' : 'A';
     const timeStr = timestamp ? new Date(timestamp).toLocaleTimeString() : new Date().toLocaleTimeString();
     let renderedContent;
     if (role === 'assistant') {
@@ -105,7 +100,7 @@ function appendMessage(role, content, timestamp = null) {
         renderedContent = escapeHtml(content).replace(/\n/g, '<br>');
     }
     messageDiv.innerHTML = `
-        <div class="avatar">${avatar}</div>
+        <div class="avatar">${avatarText}</div>
         <div class="message-content">
             <div class="bubble">${renderedContent}</div>
             <div class="timestamp">${timeStr}</div>
@@ -126,7 +121,7 @@ async function loadHistory() {
                 appendMessage(msg.role, msg.content, msg.created_at);
             }
         } else if (messagesArea.children.length === 0) {
-            appendMessage('assistant', '你好！我是智能助手，基于 Llama 3 模型。有什么可以帮助你的吗？');
+            appendMessage('assistant', '你好！我是智能助手。有什么可以帮助你的吗？');
         }
         scrollToBottom();
     } catch (err) {
@@ -146,7 +141,7 @@ function setLoading(loading) {
         const loader = document.createElement('div');
         loader.id = 'loadingIndicator';
         loader.className = 'loading-indicator';
-        loader.innerHTML = '<div class="loading-dot"></div><div class="loading-dot"></div><div class="loading-dot"></div><span style="margin-left:6px">AI 正在思考...</span>';
+        loader.textContent = 'AI 正在思考...';
         messagesArea.appendChild(loader);
         scrollToBottom();
     } else {
@@ -164,26 +159,31 @@ async function sendMessage() {
     userInput.style.height = 'auto';
     setLoading(true);
 
-    // 重置流式消息引用
     lastAssistantMessageDiv = null;
+
+    // 获取选中的模型
+    const selectedModel = modelSelect.value;
 
     try {
         const response = await fetch('/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sessionId: currentSessionId, message })
+            body: JSON.stringify({ 
+                sessionId: currentSessionId, 
+                message,
+                model: selectedModel
+            })
         });
 
         if (!response.ok) {
             const errorData = await response.json();
             let errMsg = errorData.error || '服务器错误';
             if (errorData.retryAfter) errMsg += ` (请 ${Math.ceil(errorData.retryAfter)} 秒后重试)`;
-            appendMessage('assistant', `❌ 出错：${errMsg}`);
+            appendMessage('assistant', `出错：${errMsg}`);
             setLoading(false);
             return;
         }
 
-        // 处理流式响应
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
@@ -209,13 +209,10 @@ async function sendMessage() {
                             fullReply += parsed.content;
                             appendOrUpdateAssistantMessage(parsed.content, false);
                         }
-                    } catch (e) {
-                        // 忽略解析错误
-                    }
+                    } catch (e) {}
                 }
             }
         }
-        // 最终完成，传入完整文本以更新最终渲染（确保 Markdown 完整）
         if (fullReply) {
             appendOrUpdateAssistantMessage(fullReply, true);
         } else {
@@ -223,7 +220,7 @@ async function sendMessage() {
         }
     } catch (err) {
         console.error(err);
-        appendMessage('assistant', '⚠️ 网络错误，请检查连接后重试');
+        appendMessage('assistant', '网络错误，请检查连接后重试');
     } finally {
         setLoading(false);
     }
@@ -233,7 +230,7 @@ function newChat() {
     currentSessionId = generateUUID();
     localStorage.setItem('chat_session_id', currentSessionId);
     messagesArea.innerHTML = '';
-    appendMessage('assistant', '✨ 已开启全新会话！你可以开始提问了。');
+    appendMessage('assistant', '已开启全新会话！你可以开始提问了。');
     scrollToBottom();
 }
 
