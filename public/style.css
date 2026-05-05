@@ -7,7 +7,7 @@
 body {
     font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
     background: #1e1f2c;
-    height: 100dvh;          /* 使用动态视口高度，解决移动端工具栏遮挡 */
+    height: 100dvh;
     overflow: hidden;
     display: flex;
     flex-direction: column;
@@ -22,10 +22,9 @@ body {
     flex-direction: column;
     margin: 0 auto;
     box-shadow: 0 0 30px rgba(0,0,0,0.3);
-    overflow: hidden;        /* 防止整体滚动 */
+    overflow: hidden;
 }
 
-/* 头部固定 */
 .chat-header {
     background: #2a2b38;
     padding: 16px 24px;
@@ -33,7 +32,9 @@ body {
     justify-content: space-between;
     align-items: center;
     border-bottom: 1px solid #3e3f4e;
-    flex-shrink: 0;          /* 不允许缩小 */
+    flex-shrink: 0;
+    flex-wrap: wrap;
+    gap: 12px;
 }
 
 .title {
@@ -61,6 +62,27 @@ h1 {
     font-family: monospace;
 }
 
+.header-actions {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+}
+
+.model-select {
+    background: #3b3f5c;
+    border: 1px solid #5a5f7e;
+    border-radius: 30px;
+    padding: 6px 12px;
+    color: white;
+    font-size: 0.85rem;
+    cursor: pointer;
+    outline: none;
+}
+
+.model-select:hover {
+    background: #535982;
+}
+
 .new-chat-btn {
     background: #3b3f5c;
     border: none;
@@ -78,7 +100,6 @@ h1 {
     transform: scale(0.97);
 }
 
-/* 消息区域：自动填满剩余空间，并允许滚动 */
 .messages-area {
     flex: 1;
     overflow-y: auto;
@@ -87,7 +108,7 @@ h1 {
     flex-direction: column;
     gap: 16px;
     scroll-behavior: smooth;
-    min-height: 0;           /* flex 子项溢出修复 */
+    min-height: 0;
 }
 
 .message {
@@ -114,8 +135,10 @@ h1 {
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 1.2rem;
+    font-size: 1rem;
+    font-weight: bold;
     flex-shrink: 0;
+    color: #eef2ff;
 }
 
 .user .avatar {
@@ -154,7 +177,6 @@ h1 {
     border-bottom-left-radius: 4px;
 }
 
-/* Markdown 内容样式 */
 .bubble p {
     margin: 0 0 0.5em 0;
 }
@@ -205,7 +227,6 @@ h1 {
     margin-right: 8px;
 }
 
-/* 输入区域：固定在底部，不缩放 */
 .input-area {
     background: #1a1b26;
     padding: 12px 20px 16px;
@@ -213,7 +234,7 @@ h1 {
     display: flex;
     gap: 12px;
     align-items: flex-end;
-    flex-shrink: 0;          /* 防止被压缩 */
+    flex-shrink: 0;
 }
 
 textarea {
@@ -260,31 +281,13 @@ button:disabled {
 }
 
 .loading-indicator {
-    display: flex;
-    gap: 6px;
-    align-items: center;
     padding: 10px 16px;
     background: #22232e;
     border-radius: 30px;
     width: fit-content;
     color: #b9c3ff;
     margin-top: 8px;
-}
-
-.loading-dot {
-    width: 8px;
-    height: 8px;
-    background: #8d9eff;
-    border-radius: 50%;
-    animation: pulse 1s infinite;
-}
-
-.loading-dot:nth-child(2) { animation-delay: 0.2s; }
-.loading-dot:nth-child(3) { animation-delay: 0.4s; }
-
-@keyframes pulse {
-    0%, 100% { opacity: 0.3; transform: scale(0.8); }
-    50% { opacity: 1; transform: scale(1.2); }
+    font-size: 0.85rem;
 }
 
 @keyframes fadeIn {
@@ -302,7 +305,6 @@ button:disabled {
     flex-shrink: 0;
 }
 
-/* 手机适配 */
 @media (max-width: 640px) {
     .message {
         max-width: 92%;
@@ -313,6 +315,11 @@ button:disabled {
     }
     .chat-header {
         padding: 12px 16px;
+        flex-direction: column;
+        align-items: stretch;
+    }
+    .header-actions {
+        justify-content: space-between;
     }
     .messages-area {
         padding: 12px;
@@ -323,7 +330,7 @@ button:disabled {
     .avatar {
         width: 30px;
         height: 30px;
-        font-size: 1rem;
+        font-size: 0.9rem;
     }
     button {
         padding: 8px 16px;
