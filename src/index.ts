@@ -12,8 +12,18 @@ const DEFAULT_MODEL = '@cf/meta/llama-3-8b-instruct';
 const CONTEXT_LIMIT = 15;
 const RATE_LIMIT = 10;
 const RATE_WINDOW = 60;
+const KV_TTL_BUFFER = 5;
 
-const initSQL = "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP); CREATE INDEX IF NOT EXISTS idx_session_id ON messages(session_id);";
+const initSQL = `
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  content TEXT NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_session_id ON messages(session_id);
+`;
 
 function isValidSessionId(id: string): boolean {
   return /^[a-zA-Z0-9\-_]{20,40}$/.test(id);
@@ -27,89 +37,80 @@ async function checkRateLimit(kv: KVNamespace, sessionId: string) {
   const key = `rate:${sessionId}`;
   const now = Math.floor(Date.now() / 1000);
   const windowStart = now - RATE_WINDOW;
+
   let timestamps = (await kv.get(key, 'json')) as number[];
   if (!Array.isArray(timestamps)) timestamps = [];
-  timestamps = timestamps.filter(t => t > windowStart);
+
+  timestamps = timestamps.filter(t => t > windowStart).slice(-RATE_LIMIT);
+
   if (timestamps.length >= RATE_LIMIT) {
     const oldest = Math.min(...timestamps);
     const retryAfter = RATE_WINDOW - (now - oldest);
     return { allowed: false, retryAfter: Math.max(1, retryAfter) };
   }
+
   timestamps.push(now);
-  await kv.put(key, JSON.stringify(timestamps), { expirationTtl: RATE_WINDOW + 5 });
+  await kv.put(key, JSON.stringify(timestamps), { expirationTtl: RATE_WINDOW + KV_TTL_BUFFER });
   return { allowed: true };
 }
 
 async function updateSessionStats(kv: KVNamespace, sessionId: string) {
   const countKey = `stats:${sessionId}:msgs`;
+  const lastKey = `stats:${sessionId}:last`;
+  const ttl7d = 86400 * 7;
+
   let count = (await kv.get(countKey, 'json')) as number;
-  if (count === null) count = 0;
-  await kv.put(countKey, JSON.stringify(count + 2), { expirationTtl: 86400 * 7 });
-  await kv.put(`stats:${sessionId}:last`, Date.now().toString(), { expirationTtl: 86400 * 7 });
+  count = count ?? 0;
+
+  await Promise.all([
+    kv.put(countKey, JSON.stringify(count + 2), { expirationTtl: ttl7d }),
+    kv.put(lastKey, Date.now().toString(), { expirationTtl: ttl7d })
+  ]);
 }
 
-// 健壮的流解析器：将 AI 返回的原始流转换为 SSE，并累积完整文本
-function createSSEStream(aiStream: ReadableStream, onComplete: (fullText: string) => void): ReadableStream {
+// 可靠的流处理：直接读取AI返回的每个完整JSON行，累积回复并转发给前端
+function createSSEStream(
+  aiStream: ReadableStream,
+  onComplete: (fullText: string) => Promise<void>
+): ReadableStream {
   let fullText = '';
   const encoder = new TextEncoder();
-  
-  // 使用管道处理流：先转为文本，再按行分割
-  const textStream = aiStream.pipeThrough(new TextDecoderStream());
-  const lineBreakStream = new TransformStream({
-    transform(chunk, controller) {
-      const lines = chunk.split(/\r?\n/);
-      for (let i = 0; i < lines.length - 1; i++) {
-        controller.enqueue(lines[i]);
-      }
-      if (lines.length > 0) {
-        // 保留最后一行不完整的行
-        this.remaining = (this.remaining || '') + lines[lines.length - 1];
-      }
-    },
-    flush(controller) {
-      if (this.remaining) controller.enqueue(this.remaining);
-    }
-  });
-  
-  const lineReader = textStream.pipeThrough(lineBreakStream);
-  const reader = lineReader.getReader();
-  
+  const reader = aiStream.getReader();
+
   return new ReadableStream({
     async start(controller) {
       try {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          const line = value.trim();
-          if (line === '') continue;
-          
-          // 尝试解析 JSON
+
+          // Cloudflare Workers AI 流式返回的是 UTF-8 文本，每个 chunk 可能是一个完整的 JSON 行
+          const chunkStr = new TextDecoder().decode(value);
           try {
-            // 兼容两种格式：直接 JSON 或 "data: {...}"
-            let jsonStr = line;
-            if (line.startsWith('data: ')) {
-              jsonStr = line.slice(6);
-              if (jsonStr === '[DONE]') continue;
+            const json = JSON.parse(chunkStr);
+            const content = json.response ?? '';
+            if (content) {
+              fullText += content;
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ content })}\n\n`));
             }
-            const parsed = JSON.parse(jsonStr);
-            if (parsed.response && typeof parsed.response === 'string') {
-              const chunk = parsed.response;
-              fullText += chunk;
-              // 转发给前端
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ content: chunk })}\n\n`));
-            }
-          } catch (err) {
-            console.warn('Failed to parse line:', line, err);
+          } catch {
+            // 忽略无法解析的分片（理论上不会发生，但防御）
+            continue;
           }
         }
       } catch (err) {
-        console.error('Stream processing error', err);
+        console.error('Stream read error:', err);
       } finally {
+        // 始终发送结束标记
         controller.enqueue(encoder.encode('data: [DONE]\n\n'));
         controller.close();
-        onComplete(fullText);
+        // 异步保存完整回复到数据库（即使流出错，也会尝试保存已有文本）
+        await onComplete(fullText || '抱歉，生成回答失败。');
       }
     },
+    cancel() {
+      reader.cancel();
+    }
   });
 }
 
@@ -118,7 +119,7 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // CORS
+    // 预检 OPTIONS
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         status: 204,
@@ -126,19 +127,21 @@ export default {
           'Access-Control-Allow-Origin': '*',
           'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type',
-        },
+          'Access-Control-Max-Age': '86400'
+        }
       });
     }
 
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
       'Content-Type': 'application/json',
+      'X-Content-Type-Options': 'nosniff'
     };
 
-    const errorResponse = (msg: string, status: number = 500) =>
+    const errorResponse = (msg: string, status = 500) =>
       Response.json({ error: msg }, { status, headers: corsHeaders });
 
-    // GET /api/history
+    // 获取历史记录
     if (path === '/api/history' && request.method === 'GET') {
       try {
         await ensureTable(env.DB);
@@ -146,17 +149,23 @@ export default {
         if (!sessionId || !isValidSessionId(sessionId)) {
           return errorResponse('无效或缺失 sessionId', 400);
         }
-        const { results } = await env.DB.prepare(
-          `SELECT role, content, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC LIMIT 200`
-        ).bind(sessionId).all();
+
+        const { results } = await env.DB.prepare(`
+          SELECT role, content, created_at 
+          FROM messages 
+          WHERE session_id = ? 
+          ORDER BY created_at ASC 
+          LIMIT 200
+        `).bind(sessionId).all();
+
         return Response.json({ messages: results }, { headers: corsHeaders });
       } catch (err: any) {
-        console.error('History error', err);
+        console.error('History query error:', err);
         return errorResponse(`数据库查询失败: ${err.message}`);
       }
     }
 
-    // POST /api/chat
+    // 流式聊天接口
     if (path === '/api/chat' && request.method === 'POST') {
       try {
         await ensureTable(env.DB);
@@ -164,19 +173,22 @@ export default {
         return errorResponse(`数据库初始化失败: ${err.message}`);
       }
 
-      let body: any;
+      let body: { sessionId?: string; message?: string; model?: string };
       try {
         body = await request.json();
       } catch {
-        return errorResponse('无效的 JSON', 400);
+        return errorResponse('请求体不是合法 JSON', 400);
       }
+
       const { sessionId, message, model } = body;
+      const userContent = message?.trim() ?? '';
       const selectedModel = model && typeof model === 'string' ? model : DEFAULT_MODEL;
 
-      if (!sessionId || !isValidSessionId(sessionId) || !message?.trim()) {
+      if (!sessionId || !isValidSessionId(sessionId) || !userContent) {
         return errorResponse('缺少有效的 sessionId 或消息内容', 400);
       }
 
+      // 限流
       const rate = await checkRateLimit(env.KV_BINDING, sessionId);
       if (!rate.allowed) {
         return Response.json(
@@ -186,51 +198,66 @@ export default {
       }
 
       // 1. 保存用户消息
-      let userMessageId: number | null = null;
+      let userMsgId: number | null = null;
       try {
-        const insertUser = await env.DB.prepare(
-          `INSERT INTO messages (session_id, role, content) VALUES (?, 'user', ?)`
-        ).bind(sessionId, message.trim()).run();
-        userMessageId = insertUser.meta.last_row_id;
+        const res = await env.DB.prepare(`
+          INSERT INTO messages (session_id, role, content) 
+          VALUES (?, 'user', ?)
+        `).bind(sessionId, userContent).run();
+        userMsgId = res.meta.last_row_id;
       } catch (err: any) {
         return errorResponse('保存用户消息失败');
       }
 
-      // 2. 获取历史上下文（不包括当前用户消息？当前用户消息已经在数据库中了，但为了上下文，可以包含它）
-      // 注意：当前用户消息刚插入，查询时会包含在内，这没问题。
-      const { results: history } = await env.DB.prepare(
-        `SELECT role, content FROM messages WHERE session_id = ? ORDER BY created_at ASC LIMIT ?`
-      ).bind(sessionId, CONTEXT_LIMIT).all();
-
-      const aiMessages = [
-        { role: 'system', content: SYSTEM_PROMPT },
-        ...(history as any[]).map(row => ({ role: row.role, content: row.content }))
-      ];
-
-      // 3. 调用流式 AI
-      let aiStream: ReadableStream;
+      // 2. 获取历史上下文
+      let historyRows: Array<{ role: string; content: string }> = [];
       try {
-        aiStream = await env.AI.run(selectedModel, { messages: aiMessages, stream: true }) as ReadableStream;
+        const { results } = await env.DB.prepare(`
+          SELECT role, content 
+          FROM messages 
+          WHERE session_id = ? 
+          ORDER BY created_at ASC 
+          LIMIT ?
+        `).bind(sessionId, CONTEXT_LIMIT).all();
+        historyRows = results as any[];
       } catch (err: any) {
-        // 失败时删除用户消息
-        if (userMessageId) {
-          await env.DB.prepare(`DELETE FROM messages WHERE id = ?`).bind(userMessageId).run();
-        }
-        return errorResponse(`AI 启动失败: ${err.message}`);
+        // 回滚用户消息
+        if (userMsgId) await env.DB.prepare(`DELETE FROM messages WHERE id = ?`).bind(userMsgId).run();
+        return errorResponse('获取对话上下文失败');
       }
 
-      // 4. 流结束后保存完整回复
-      const onComplete = async (fullReply: string) => {
-        if (!fullReply) {
-          fullReply = '抱歉，我无法生成回答。';
+      // 组装 AI 消息（系统提示 + 历史）
+      const aiMessages = [
+        { role: 'system', content: SYSTEM_PROMPT },
+        ...historyRows
+      ];
+
+      // 3. 调用 AI 流式接口
+      let aiStream: ReadableStream;
+      try {
+        aiStream = await env.AI.run(selectedModel, {
+          messages: aiMessages,
+          stream: true
+        }) as ReadableStream;
+      } catch (err: any) {
+        // 失败时删除用户消息
+        if (userMsgId) {
+          await env.DB.prepare(`DELETE FROM messages WHERE id = ?`).bind(userMsgId).run();
         }
+        return errorResponse(`AI 模型调用失败: ${err.message}`);
+      }
+
+      // 流结束后保存助手回复
+      const onComplete = async (fullReply: string) => {
         try {
-          await env.DB.prepare(`INSERT INTO messages (session_id, role, content) VALUES (?, 'assistant', ?)`)
-            .bind(sessionId, fullReply).run();
+          await env.DB.prepare(`
+            INSERT INTO messages (session_id, role, content) 
+            VALUES (?, 'assistant', ?)
+          `).bind(sessionId, fullReply).run();
           await updateSessionStats(env.KV_BINDING, sessionId);
-          console.log(`Saved assistant reply for session ${sessionId}, length: ${fullReply.length}`);
+          console.log(`[Session ${sessionId}] 已保存助手回复，长度: ${fullReply.length}`);
         } catch (err) {
-          console.error('Failed to save assistant reply', err);
+          console.error('保存助手回复失败:', err);
         }
       };
 
@@ -239,13 +266,15 @@ export default {
       return new Response(sseStream, {
         headers: {
           'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
           'Connection': 'keep-alive',
           'Access-Control-Allow-Origin': '*',
-        },
+          'X-Content-Type-Options': 'nosniff'
+        }
       });
     }
 
+    // 静态资源
     return env.ASSETS.fetch(request);
   },
 };
