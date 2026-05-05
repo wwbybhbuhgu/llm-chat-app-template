@@ -12,24 +12,20 @@ const CONTEXT_LIMIT = 15;
 const RATE_LIMIT = 10;
 const RATE_WINDOW = 60;
 
-const initSQL = `
-  CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL,
-    role TEXT NOT NULL,
-    content TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE INDEX IF NOT EXISTS idx_session_id ON messages(session_id);
-`;
+// 单行 SQL，避免多行字符串导致的解析错误
+const initSQL = "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP); CREATE INDEX IF NOT EXISTS idx_session_id ON messages(session_id);";
 
-// 宽松的 sessionId 校验（支持前端生成的标准 UUID 或简短 ID）
 function isValidSessionId(id: string): boolean {
   return /^[a-zA-Z0-9\-_]{20,40}$/.test(id);
 }
 
 async function ensureTable(db: D1Database) {
-  await db.exec(initSQL);
+  try {
+    await db.exec(initSQL);
+  } catch (err: any) {
+    console.error('Table creation error:', err);
+    throw new Error(`Failed to initialize database: ${err.message}`);
+  }
 }
 
 async function checkRateLimit(kv: KVNamespace, sessionId: string) {
@@ -62,6 +58,7 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
+    // CORS 预检
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         status: 204,
@@ -78,37 +75,46 @@ export default {
       'Content-Type': 'application/json',
     };
 
+    // 辅助函数：响应错误
+    const errorResponse = (msg: string, status: number = 500) => 
+      Response.json({ error: msg }, { status, headers: corsHeaders });
+
     // ---------- API 路由 ----------
     // GET /api/history
     if (path === '/api/history' && request.method === 'GET') {
-      await ensureTable(env.DB); // 确保表存在
-      const sessionId = url.searchParams.get('sessionId');
-      if (!sessionId || !isValidSessionId(sessionId)) {
-        return Response.json({ error: '无效或缺失 sessionId' }, { status: 400, headers: corsHeaders });
-      }
       try {
+        await ensureTable(env.DB);
+        const sessionId = url.searchParams.get('sessionId');
+        if (!sessionId || !isValidSessionId(sessionId)) {
+          return errorResponse('无效或缺失 sessionId', 400);
+        }
         const { results } = await env.DB.prepare(
           `SELECT role, content, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC LIMIT 200`
         ).bind(sessionId).all();
         return Response.json({ messages: results }, { headers: corsHeaders });
       } catch (err: any) {
         console.error('History error', err);
-        return Response.json({ error: '数据库查询失败: ' + err.message }, { status: 500, headers: corsHeaders });
+        return errorResponse(`数据库查询失败: ${err.message}`);
       }
     }
 
     // POST /api/chat
     if (path === '/api/chat' && request.method === 'POST') {
-      await ensureTable(env.DB); // 确保表存在
+      try {
+        await ensureTable(env.DB);
+      } catch (err: any) {
+        return errorResponse(`数据库初始化失败: ${err.message}`);
+      }
+
       let body: any;
       try {
         body = await request.json();
       } catch {
-        return Response.json({ error: '无效的 JSON' }, { status: 400, headers: corsHeaders });
+        return errorResponse('无效的 JSON', 400);
       }
       const { sessionId, message } = body;
       if (!sessionId || !isValidSessionId(sessionId) || !message?.trim()) {
-        return Response.json({ error: '缺少有效的 sessionId 或消息内容' }, { status: 400, headers: corsHeaders });
+        return errorResponse('缺少有效的 sessionId 或消息内容', 400);
       }
 
       const rate = await checkRateLimit(env.KV_BINDING, sessionId);
@@ -150,7 +156,7 @@ export default {
             `DELETE FROM messages WHERE session_id = ? AND id = (SELECT id FROM messages WHERE session_id = ? AND role = 'user' ORDER BY id DESC LIMIT 1)`
           ).bind(sessionId, sessionId).run();
         } catch (e) {}
-        return Response.json({ error: 'AI 服务出错: ' + err.message }, { status: 500, headers: corsHeaders });
+        return errorResponse(`AI 服务出错: ${err.message}`);
       }
     }
 
