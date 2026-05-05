@@ -23,9 +23,13 @@ const initSQL = `
   CREATE INDEX IF NOT EXISTS idx_session_id ON messages(session_id);
 `;
 
-// 宽松的 sessionId 校验：允许字母数字和短横线，长度 20~40（兼容前端可能生成的不标准ID）
+// 宽松的 sessionId 校验（支持前端生成的标准 UUID 或简短 ID）
 function isValidSessionId(id: string): boolean {
   return /^[a-zA-Z0-9\-_]{20,40}$/.test(id);
+}
+
+async function ensureTable(db: D1Database) {
+  await db.exec(initSQL);
 }
 
 async function checkRateLimit(kv: KVNamespace, sessionId: string) {
@@ -58,7 +62,6 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // CORS 预检
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         status: 204,
@@ -75,12 +78,10 @@ export default {
       'Content-Type': 'application/json',
     };
 
-    // 后台初始化数据库（确保表存在）
-    ctx.waitUntil(env.DB.exec(initSQL).catch(e => console.error('DB init error', e)));
-
-    // ---------- API 路由（必须放在 Assets 之前）----------
+    // ---------- API 路由 ----------
     // GET /api/history
     if (path === '/api/history' && request.method === 'GET') {
+      await ensureTable(env.DB); // 确保表存在
       const sessionId = url.searchParams.get('sessionId');
       if (!sessionId || !isValidSessionId(sessionId)) {
         return Response.json({ error: '无效或缺失 sessionId' }, { status: 400, headers: corsHeaders });
@@ -98,6 +99,7 @@ export default {
 
     // POST /api/chat
     if (path === '/api/chat' && request.method === 'POST') {
+      await ensureTable(env.DB); // 确保表存在
       let body: any;
       try {
         body = await request.json();
@@ -109,7 +111,6 @@ export default {
         return Response.json({ error: '缺少有效的 sessionId 或消息内容' }, { status: 400, headers: corsHeaders });
       }
 
-      // 限流
       const rate = await checkRateLimit(env.KV_BINDING, sessionId);
       if (!rate.allowed) {
         return Response.json(
@@ -123,7 +124,6 @@ export default {
         await env.DB.prepare(`INSERT INTO messages (session_id, role, content) VALUES (?, 'user', ?)`)
           .bind(sessionId, message.trim()).run();
 
-        // 获取历史上下文
         const { results: history } = await env.DB.prepare(
           `SELECT role, content FROM messages WHERE session_id = ? ORDER BY created_at ASC LIMIT ?`
         ).bind(sessionId, CONTEXT_LIMIT).all();
@@ -133,11 +133,9 @@ export default {
           ...(history as any[]).map(row => ({ role: row.role, content: row.content }))
         ];
 
-        // 调用 AI
         const aiResp = await env.AI.run(AI_MODEL, { messages: aiMessages });
         let reply = (aiResp as any)?.response || '抱歉，我暂时无法生成回答。';
 
-        // 保存 AI 回复
         await env.DB.prepare(`INSERT INTO messages (session_id, role, content) VALUES (?, 'assistant', ?)`)
           .bind(sessionId, reply).run();
 
@@ -156,8 +154,7 @@ export default {
       }
     }
 
-    // ---------- 静态资源（必须放在最后）----------
-    // 注意：如果访问 /favicon.ico 等不存在资源，Assets 会返回 404，这不是错误，可以忽略。
+    // 静态资源
     return env.ASSETS.fetch(request);
   },
 };
