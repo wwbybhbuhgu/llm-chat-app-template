@@ -1,22 +1,31 @@
-/**
- * For more details on how to configure Wrangler, refer to:
- * https://developers.cloudflare.com/workers/wrangler/configuration/
- */
 {
-	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "llm-chat-app-template",
-	"main": "src/index.ts",
-	"compatibility_date": "2025-10-08",
-	"compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
-	"assets": {
-		"binding": "ASSETS",
-		"directory": "./public"
-	},
-	"observability": {
-		"enabled": true
-	},
-	"ai": {
-		"binding": "AI"
-	},
-	"upload_source_maps": true
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "llm-chat-app",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-10-08",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "binding": "ASSETS",
+    "directory": "./public"
+  },
+  "ai": {
+    "binding": "AI"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ai-chat",
+      "database_id": "a3ce8088-9402-4f7c-96ef-0ddb88f6ea24"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "KV_BINDING",
+      "id": "b9f9a9c18ad14b18a1f42fb9f4950ee2"
+    }
+  ],
+  "observability": {
+    "enabled": true
+  },
+  "upload_source_maps": true
 }
