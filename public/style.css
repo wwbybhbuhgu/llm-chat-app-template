@@ -7,24 +7,25 @@
 body {
     font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
     background: #1e1f2c;
-    height: 100vh;
-    display: flex;
-    justify-content: center;
-    align-items: center;
+    height: 100dvh;          /* 使用动态视口高度，解决移动端工具栏遮挡 */
     overflow: hidden;
+    display: flex;
+    flex-direction: column;
 }
 
 .chat-container {
     width: 100%;
     max-width: 1200px;
-    height: 100vh;
+    height: 100%;
     background: #0f0f13;
     display: flex;
     flex-direction: column;
+    margin: 0 auto;
     box-shadow: 0 0 30px rgba(0,0,0,0.3);
+    overflow: hidden;        /* 防止整体滚动 */
 }
 
-/* 头部 */
+/* 头部固定 */
 .chat-header {
     background: #2a2b38;
     padding: 16px 24px;
@@ -32,7 +33,7 @@ body {
     justify-content: space-between;
     align-items: center;
     border-bottom: 1px solid #3e3f4e;
-    flex-shrink: 0;
+    flex-shrink: 0;          /* 不允许缩小 */
 }
 
 .title {
@@ -77,7 +78,7 @@ h1 {
     transform: scale(0.97);
 }
 
-/* 消息区域 */
+/* 消息区域：自动填满剩余空间，并允许滚动 */
 .messages-area {
     flex: 1;
     overflow-y: auto;
@@ -86,6 +87,7 @@ h1 {
     flex-direction: column;
     gap: 16px;
     scroll-behavior: smooth;
+    min-height: 0;           /* flex 子项溢出修复 */
 }
 
 .message {
@@ -203,14 +205,15 @@ h1 {
     margin-right: 8px;
 }
 
+/* 输入区域：固定在底部，不缩放 */
 .input-area {
     background: #1a1b26;
-    padding: 16px 20px 20px;
+    padding: 12px 20px 16px;
     border-top: 1px solid #2e3040;
     display: flex;
     gap: 12px;
     align-items: flex-end;
-    flex-shrink: 0;
+    flex-shrink: 0;          /* 防止被压缩 */
 }
 
 textarea {
@@ -293,9 +296,10 @@ button:disabled {
     text-align: center;
     font-size: 0.7rem;
     color: #56587a;
-    padding: 8px 0 10px;
+    padding: 6px 0 8px;
     background: #0f0f13;
     border-top: 1px solid #22232e;
+    flex-shrink: 0;
 }
 
 /* 手机适配 */
@@ -314,11 +318,15 @@ button:disabled {
         padding: 12px;
     }
     .input-area {
-        padding: 12px 16px;
+        padding: 10px 16px 14px;
     }
     .avatar {
         width: 30px;
         height: 30px;
         font-size: 1rem;
+    }
+    button {
+        padding: 8px 16px;
+        height: 42px;
     }
 }
