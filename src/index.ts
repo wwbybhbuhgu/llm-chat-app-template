@@ -48,7 +48,7 @@ async function updateSessionStats(kv: KVNamespace, sessionId: string) {
   await kv.put(`stats:${sessionId}:last`, Date.now().toString(), { expirationTtl: 86400 * 7 });
 }
 
-// 创建一个安全的 SSE 流，并确保在流结束时调用 onComplete（即使出错）
+// 创建 SSE 流，在流结束后调用 onComplete
 function createSSEStream(aiStream: ReadableStream, onComplete: (fullText: string) => void): ReadableStream {
   let fullText = '';
   const encoder = new TextEncoder();
@@ -83,7 +83,6 @@ function createSSEStream(aiStream: ReadableStream, onComplete: (fullText: string
             }
           }
         }
-        // 处理残余 buffer
         if (buffer.startsWith('data: ')) {
           const jsonStr = buffer.slice(6);
           if (jsonStr !== '[DONE]') {
@@ -100,15 +99,10 @@ function createSSEStream(aiStream: ReadableStream, onComplete: (fullText: string
         streamError = err;
         console.error('Stream reading error', err);
       } finally {
-        // 无论成功还是失败，都发送结束标记并调用 onComplete
         controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
         controller.close();
-        // 如果出错，fullText 可能不完整，但仍然保存已有的内容（或保存错误提示）
-        if (streamError) {
-          onComplete(fullText || '抱歉，生成回复时出现错误。');
-        } else {
-          onComplete(fullText);
-        }
+        // 无论成功失败，都将已有的文本（或空字符串）传给 onComplete
+        onComplete(streamError ? (fullText || '抱歉，生成回复时出现错误。') : fullText);
       }
     },
   });
@@ -186,73 +180,44 @@ export default {
       }
 
       // 1. 保存用户消息
+      let userMessageId: number | null = null;
       try {
-        await env.DB.prepare(`INSERT INTO messages (session_id, role, content) VALUES (?, 'user', ?)`)
-          .bind(sessionId, message.trim()).run();
+        const insertUser = await env.DB.prepare(
+          `INSERT INTO messages (session_id, role, content) VALUES (?, 'user', ?)`
+        ).bind(sessionId, message.trim()).run();
+        userMessageId = insertUser.meta.last_row_id;
       } catch (err: any) {
         return errorResponse('保存用户消息失败');
       }
 
-      // 2. 创建 assistant 占位消息，以便即使流中断也有一条记录
-      let assistantMessageId: number | null = null;
-      try {
-        const insertAssistant = await env.DB.prepare(
-          `INSERT INTO messages (session_id, role, content) VALUES (?, 'assistant', '')`
-        ).bind(sessionId).run();
-        assistantMessageId = insertAssistant.meta.last_row_id;
-      } catch (err) {
-        // 占位失败则回滚用户消息
-        await env.DB.prepare(
-          `DELETE FROM messages WHERE session_id = ? AND id = (SELECT id FROM messages WHERE session_id = ? AND role = 'user' ORDER BY id DESC LIMIT 1)`
-        ).bind(sessionId, sessionId).run();
-        return errorResponse('无法创建助手消息占位');
-      }
-
-      // 3. 获取历史上下文（包含刚插入的空 assistant 和之前的消息）
+      // 2. 获取历史上下文（仅已完整保存的消息，不包含可能正在生成的回复）
       const { results: history } = await env.DB.prepare(
         `SELECT role, content FROM messages WHERE session_id = ? ORDER BY created_at ASC LIMIT ?`
       ).bind(sessionId, CONTEXT_LIMIT).all();
 
-      // 注意：历史中可能包含这个空的 assistant 消息，我们需要过滤掉它（因为其内容为空，且 role 为 assistant，但还没有实际回复）
-      // 更简洁的做法：在构造 aiMessages 时，只取之前已经完成的消息（即 content 不为空，或者排除最后一条空的 assistant）。
-      // 由于我们刚刚插入的空消息 id 最大，我们可以在查询时排除最后一条空消息，或者简单地在内存中过滤。
-      const filteredHistory = (history as any[]).filter((row, index, arr) => {
-        // 如果这条消息 role 是 assistant 且 content 为空，并且它是最后一条消息，则跳过
-        if (row.role === 'assistant' && row.content === '' && index === arr.length - 1) {
-          return false;
-        }
-        return true;
-      });
-
       const aiMessages = [
         { role: 'system', content: SYSTEM_PROMPT },
-        ...filteredHistory.map(row => ({ role: row.role, content: row.content }))
+        ...(history as any[]).map(row => ({ role: row.role, content: row.content }))
       ];
 
-      // 4. 调用流式 AI
+      // 3. 调用流式 AI
       let aiStream: ReadableStream;
       try {
         aiStream = await env.AI.run(selectedModel, { messages: aiMessages, stream: true }) as ReadableStream;
       } catch (err: any) {
-        // AI 调用失败，删除用户消息和占位消息
-        await env.DB.prepare(
-          `DELETE FROM messages WHERE session_id = ? AND id IN (SELECT id FROM messages WHERE session_id = ? AND role = 'user' ORDER BY id DESC LIMIT 1)`
-        ).bind(sessionId, sessionId).run();
-        await env.DB.prepare(`DELETE FROM messages WHERE id = ?`).bind(assistantMessageId).run();
+        // AI 调用失败，删除刚才保存的用户消息
+        if (userMessageId) {
+          await env.DB.prepare(`DELETE FROM messages WHERE id = ?`).bind(userMessageId).run();
+        }
         return errorResponse(`AI 流启动失败: ${err.message}`);
       }
 
-      // 5. 定义完成回调：更新占位消息的内容
+      // 4. 定义完成回调：在流结束后将完整的 assistant 回复存入数据库
       const onComplete = async (fullReply: string) => {
         if (!fullReply) fullReply = '抱歉，我无法生成回答。';
         try {
-          if (assistantMessageId) {
-            await env.DB.prepare(`UPDATE messages SET content = ? WHERE id = ?`).bind(fullReply, assistantMessageId).run();
-          } else {
-            // 降级：插入新消息
-            await env.DB.prepare(`INSERT INTO messages (session_id, role, content) VALUES (?, 'assistant', ?)`)
-              .bind(sessionId, fullReply).run();
-          }
+          await env.DB.prepare(`INSERT INTO messages (session_id, role, content) VALUES (?, 'assistant', ?)`)
+            .bind(sessionId, fullReply).run();
           await updateSessionStats(env.KV_BINDING, sessionId);
         } catch (err) {
           console.error('Failed to save assistant reply', err);
