@@ -48,61 +48,66 @@ async function updateSessionStats(kv: KVNamespace, sessionId: string) {
   await kv.put(`stats:${sessionId}:last`, Date.now().toString(), { expirationTtl: 86400 * 7 });
 }
 
-// 创建 SSE 流，在流结束后调用 onComplete
+// 健壮的流解析器：将 AI 返回的原始流转换为 SSE，并累积完整文本
 function createSSEStream(aiStream: ReadableStream, onComplete: (fullText: string) => void): ReadableStream {
   let fullText = '';
   const encoder = new TextEncoder();
-  const decoder = new TextDecoder();
-
+  
+  // 使用管道处理流：先转为文本，再按行分割
+  const textStream = aiStream.pipeThrough(new TextDecoderStream());
+  const lineBreakStream = new TransformStream({
+    transform(chunk, controller) {
+      const lines = chunk.split(/\r?\n/);
+      for (let i = 0; i < lines.length - 1; i++) {
+        controller.enqueue(lines[i]);
+      }
+      if (lines.length > 0) {
+        // 保留最后一行不完整的行
+        this.remaining = (this.remaining || '') + lines[lines.length - 1];
+      }
+    },
+    flush(controller) {
+      if (this.remaining) controller.enqueue(this.remaining);
+    }
+  });
+  
+  const lineReader = textStream.pipeThrough(lineBreakStream);
+  const reader = lineReader.getReader();
+  
   return new ReadableStream({
     async start(controller) {
-      const reader = aiStream.getReader();
-      let buffer = '';
-      let streamError: any = null;
       try {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          let lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-          for (const line of lines) {
+          const line = value.trim();
+          if (line === '') continue;
+          
+          // 尝试解析 JSON
+          try {
+            // 兼容两种格式：直接 JSON 或 "data: {...}"
+            let jsonStr = line;
             if (line.startsWith('data: ')) {
-              const jsonStr = line.slice(6);
+              jsonStr = line.slice(6);
               if (jsonStr === '[DONE]') continue;
-              try {
-                const parsed = JSON.parse(jsonStr);
-                if (parsed.response) {
-                  const chunk = parsed.response;
-                  fullText += chunk;
-                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({ content: chunk })}\n\n`));
-                }
-              } catch (e) {
-                // 忽略解析错误
-              }
             }
-          }
-        }
-        if (buffer.startsWith('data: ')) {
-          const jsonStr = buffer.slice(6);
-          if (jsonStr !== '[DONE]') {
-            try {
-              const parsed = JSON.parse(jsonStr);
-              if (parsed.response) {
-                fullText += parsed.response;
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ content: parsed.response })}\n\n`));
-              }
-            } catch (e) {}
+            const parsed = JSON.parse(jsonStr);
+            if (parsed.response && typeof parsed.response === 'string') {
+              const chunk = parsed.response;
+              fullText += chunk;
+              // 转发给前端
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ content: chunk })}\n\n`));
+            }
+          } catch (err) {
+            console.warn('Failed to parse line:', line, err);
           }
         }
       } catch (err) {
-        streamError = err;
-        console.error('Stream reading error', err);
+        console.error('Stream processing error', err);
       } finally {
-        controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
         controller.close();
-        // 无论成功失败，都将已有的文本（或空字符串）传给 onComplete
-        onComplete(streamError ? (fullText || '抱歉，生成回复时出现错误。') : fullText);
+        onComplete(fullText);
       }
     },
   });
@@ -113,6 +118,7 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
+    // CORS
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         status: 204,
@@ -190,7 +196,8 @@ export default {
         return errorResponse('保存用户消息失败');
       }
 
-      // 2. 获取历史上下文（仅已完整保存的消息，不包含可能正在生成的回复）
+      // 2. 获取历史上下文（不包括当前用户消息？当前用户消息已经在数据库中了，但为了上下文，可以包含它）
+      // 注意：当前用户消息刚插入，查询时会包含在内，这没问题。
       const { results: history } = await env.DB.prepare(
         `SELECT role, content FROM messages WHERE session_id = ? ORDER BY created_at ASC LIMIT ?`
       ).bind(sessionId, CONTEXT_LIMIT).all();
@@ -205,20 +212,23 @@ export default {
       try {
         aiStream = await env.AI.run(selectedModel, { messages: aiMessages, stream: true }) as ReadableStream;
       } catch (err: any) {
-        // AI 调用失败，删除刚才保存的用户消息
+        // 失败时删除用户消息
         if (userMessageId) {
           await env.DB.prepare(`DELETE FROM messages WHERE id = ?`).bind(userMessageId).run();
         }
-        return errorResponse(`AI 流启动失败: ${err.message}`);
+        return errorResponse(`AI 启动失败: ${err.message}`);
       }
 
-      // 4. 定义完成回调：在流结束后将完整的 assistant 回复存入数据库
+      // 4. 流结束后保存完整回复
       const onComplete = async (fullReply: string) => {
-        if (!fullReply) fullReply = '抱歉，我无法生成回答。';
+        if (!fullReply) {
+          fullReply = '抱歉，我无法生成回答。';
+        }
         try {
           await env.DB.prepare(`INSERT INTO messages (session_id, role, content) VALUES (?, 'assistant', ?)`)
             .bind(sessionId, fullReply).run();
           await updateSessionStats(env.KV_BINDING, sessionId);
+          console.log(`Saved assistant reply for session ${sessionId}, length: ${fullReply.length}`);
         } catch (err) {
           console.error('Failed to save assistant reply', err);
         }
@@ -226,7 +236,6 @@ export default {
 
       const sseStream = createSSEStream(aiStream, onComplete);
 
-      // 返回 SSE 响应
       return new Response(sseStream, {
         headers: {
           'Content-Type': 'text/event-stream',
