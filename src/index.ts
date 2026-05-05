@@ -1,244 +1,250 @@
-// src/index.ts
-export interface Env {
-  AI: Ai;
-  DB: D1Database;
-  KV_BINDING: KVNamespace;
-  ASSETS: { fetch: (req: Request) => Promise<Response> };
+// 全局变量
+let currentSessionId = localStorage.getItem('chat_session_id');
+let isLoading = false;
+let currentStreamController = null;
+
+function generateUUID() {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+        const r = Math.random() * 16 | 0;
+        const v = c === 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+    });
 }
 
-const SYSTEM_PROMPT = `你是一个友好、乐于助人的AI助手，名字叫「智能助手」。请用中文回答用户的问题，回答简洁清晰、富有帮助性。`;
-const AI_MODEL = '@cf/meta/llama-3-8b-instruct';
-const CONTEXT_LIMIT = 15;
-const RATE_LIMIT = 10;
-const RATE_WINDOW = 60;
-
-const initSQL = "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP); CREATE INDEX IF NOT EXISTS idx_session_id ON messages(session_id);";
-
-function isValidSessionId(id: string): boolean {
-  return /^[a-zA-Z0-9\-_]{20,40}$/.test(id);
+function isValidUUID(id) {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
 }
 
-async function ensureTable(db: D1Database) {
-  await db.exec(initSQL);
+if (!currentSessionId || !isValidUUID(currentSessionId)) {
+    currentSessionId = generateUUID();
+    localStorage.setItem('chat_session_id', currentSessionId);
 }
 
-async function checkRateLimit(kv: KVNamespace, sessionId: string) {
-  const key = `rate:${sessionId}`;
-  const now = Math.floor(Date.now() / 1000);
-  const windowStart = now - RATE_WINDOW;
-  let timestamps = (await kv.get(key, 'json')) as number[];
-  if (!Array.isArray(timestamps)) timestamps = [];
-  timestamps = timestamps.filter(t => t > windowStart);
-  if (timestamps.length >= RATE_LIMIT) {
-    const oldest = Math.min(...timestamps);
-    const retryAfter = RATE_WINDOW - (now - oldest);
-    return { allowed: false, retryAfter: Math.max(1, retryAfter) };
-  }
-  timestamps.push(now);
-  await kv.put(key, JSON.stringify(timestamps), { expirationTtl: RATE_WINDOW + 5 });
-  return { allowed: true };
+const messagesArea = document.getElementById('messagesArea');
+const userInput = document.getElementById('userInput');
+const sendBtn = document.getElementById('sendBtn');
+const newChatBtn = document.getElementById('newChatBtn');
+const modelSelect = document.getElementById('modelSelect');
+
+// 配置 marked
+if (typeof marked !== 'undefined') {
+    marked.setOptions({
+        breaks: true,
+        gfm: true,
+        headerIds: false,
+        mangle: false
+    });
 }
 
-async function updateSessionStats(kv: KVNamespace, sessionId: string) {
-  const countKey = `stats:${sessionId}:msgs`;
-  let count = (await kv.get(countKey, 'json')) as number;
-  if (count === null) count = 0;
-  await kv.put(countKey, JSON.stringify(count + 2), { expirationTtl: 86400 * 7 });
-  await kv.put(`stats:${sessionId}:last`, Date.now().toString(), { expirationTtl: 86400 * 7 });
+function renderMarkdown(text) {
+    if (typeof marked !== 'undefined' && typeof DOMPurify !== 'undefined') {
+        const rawHtml = marked.parse(text);
+        return DOMPurify.sanitize(rawHtml);
+    }
+    return text.replace(/[&<>]/g, function(m) {
+        if (m === '&') return '&amp;';
+        if (m === '<') return '&lt;';
+        if (m === '>') return '&gt;';
+        return m;
+    }).replace(/\n/g, '<br>');
 }
 
-// 将 AI 流转换为 SSE 流，同时累积完整回复文本
-function createSSEStream(aiStream: ReadableStream, onComplete: (fullText: string) => void): ReadableStream {
-  let fullText = '';
-  const encoder = new TextEncoder();
-  const decoder = new TextDecoder();
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
 
-  // AI 流返回的是 JSON 对象每行，格式如：data: {"response":"Hello"}\n\n
-  // 我们需要解析每个块，提取 response 字段，然后重新包装为 SSE 格式：data: 文本块\n\n
-  // 注意：Cloudflare Workers AI 流式返回的是类似 SSE 的流，但为了通用，我们直接读取原始流，按行分割
-  return new ReadableStream({
-    async start(controller) {
-      const reader = aiStream.getReader();
-      let buffer = '';
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          // 按行分割（SSE 事件以 \n\n 分隔，但每个块可能是部分）
-          let lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              const jsonStr = line.slice(6);
-              if (jsonStr === '[DONE]') continue;
-              try {
-                const parsed = JSON.parse(jsonStr);
-                if (parsed.response) {
-                  const chunk = parsed.response;
-                  fullText += chunk;
-                  // 发送 SSE 事件
-                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({ content: chunk })}\n\n`));
-                }
-              } catch (e) {
-                // 忽略解析错误
-              }
+let lastAssistantMessageDiv = null;
+
+function appendOrUpdateAssistantMessage(contentChunk, isComplete = false) {
+    if (!lastAssistantMessageDiv) {
+        const messageDiv = document.createElement('div');
+        messageDiv.className = 'message assistant';
+        messageDiv.innerHTML = `
+            <div class="avatar">A</div>
+            <div class="message-content">
+                <div class="bubble"></div>
+                <div class="timestamp">${new Date().toLocaleTimeString()}</div>
+            </div>
+        `;
+        messagesArea.appendChild(messageDiv);
+        lastAssistantMessageDiv = messageDiv;
+    }
+    const bubbleDiv = lastAssistantMessageDiv.querySelector('.bubble');
+    let currentText = bubbleDiv.getAttribute('data-full-text') || '';
+    if (!isComplete) {
+        currentText += contentChunk;
+        bubbleDiv.setAttribute('data-full-text', currentText);
+        bubbleDiv.innerHTML = renderMarkdown(currentText);
+    } else {
+        currentText = contentChunk;
+        bubbleDiv.innerHTML = renderMarkdown(currentText);
+        lastAssistantMessageDiv = null;
+    }
+    scrollToBottom();
+}
+
+function appendMessage(role, content, timestamp = null) {
+    if (role === 'assistant' && lastAssistantMessageDiv) {
+        lastAssistantMessageDiv = null;
+    }
+    const messageDiv = document.createElement('div');
+    messageDiv.className = `message ${role}`;
+    const avatarText = role === 'user' ? 'U' : 'A';
+    const timeStr = timestamp ? new Date(timestamp).toLocaleTimeString() : new Date().toLocaleTimeString();
+    let renderedContent;
+    if (role === 'assistant') {
+        renderedContent = renderMarkdown(content);
+    } else {
+        renderedContent = escapeHtml(content).replace(/\n/g, '<br>');
+    }
+    messageDiv.innerHTML = `
+        <div class="avatar">${avatarText}</div>
+        <div class="message-content">
+            <div class="bubble">${renderedContent}</div>
+            <div class="timestamp">${timeStr}</div>
+        </div>
+    `;
+    messagesArea.appendChild(messageDiv);
+    scrollToBottom();
+}
+
+async function loadHistory() {
+    try {
+        const res = await fetch(`/api/history?sessionId=${encodeURIComponent(currentSessionId)}`);
+        if (!res.ok) return;
+        const { messages } = await res.json();
+        if (messages && messages.length > 0) {
+            messagesArea.innerHTML = '';
+            for (const msg of messages) {
+                appendMessage(msg.role, msg.content, msg.created_at);
             }
-          }
+        } else if (messagesArea.children.length === 0) {
+            appendMessage('assistant', '你好！我是智能助手。有什么可以帮助你的吗？');
         }
-        // 处理剩余 buffer
-        if (buffer.startsWith('data: ')) {
-          const jsonStr = buffer.slice(6);
-          if (jsonStr !== '[DONE]') {
-            try {
-              const parsed = JSON.parse(jsonStr);
-              if (parsed.response) {
-                fullText += parsed.response;
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ content: parsed.response })}\n\n`));
-              }
-            } catch (e) {}
-          }
-        }
-        // 流结束，发送结束标记
-        controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
-        controller.close();
-        // 调用完成回调，将完整文本保存到数据库（后台执行）
-        onComplete(fullText);
-      } catch (err) {
-        controller.error(err);
-      }
-    },
-  });
+        scrollToBottom();
+    } catch (err) {
+        console.error('加载历史异常', err);
+    }
 }
 
-export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const url = new URL(request.url);
-    const path = url.pathname;
+function scrollToBottom() {
+    messagesArea.scrollTop = messagesArea.scrollHeight;
+}
 
-    // CORS 预检
-    if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        status: 204,
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type',
-        },
-      });
+function setLoading(loading) {
+    isLoading = loading;
+    sendBtn.disabled = loading;
+    userInput.disabled = loading;
+    if (loading) {
+        const loader = document.createElement('div');
+        loader.id = 'loadingIndicator';
+        loader.className = 'loading-indicator';
+        loader.textContent = 'AI 正在思考...';
+        messagesArea.appendChild(loader);
+        scrollToBottom();
+    } else {
+        const existing = document.getElementById('loadingIndicator');
+        if (existing) existing.remove();
     }
+}
 
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*',
-      'Content-Type': 'application/json',
-    };
+async function sendMessage() {
+    const message = userInput.value.trim();
+    if (!message || isLoading) return;
 
-    const errorResponse = (msg: string, status: number = 500) =>
-      Response.json({ error: msg }, { status, headers: corsHeaders });
+    appendMessage('user', message);
+    userInput.value = '';
+    userInput.style.height = 'auto';
+    setLoading(true);
 
-    // GET /api/history（保持不变）
-    if (path === '/api/history' && request.method === 'GET') {
-      try {
-        await ensureTable(env.DB);
-        const sessionId = url.searchParams.get('sessionId');
-        if (!sessionId || !isValidSessionId(sessionId)) {
-          return errorResponse('无效或缺失 sessionId', 400);
+    lastAssistantMessageDiv = null;
+
+    // 获取选中的模型
+    const selectedModel = modelSelect.value;
+
+    try {
+        const response = await fetch('/api/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                sessionId: currentSessionId, 
+                message,
+                model: selectedModel
+            })
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json();
+            let errMsg = errorData.error || '服务器错误';
+            if (errorData.retryAfter) errMsg += ` (请 ${Math.ceil(errorData.retryAfter)} 秒后重试)`;
+            appendMessage('assistant', `出错：${errMsg}`);
+            setLoading(false);
+            return;
         }
-        const { results } = await env.DB.prepare(
-          `SELECT role, content, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC LIMIT 200`
-        ).bind(sessionId).all();
-        return Response.json({ messages: results }, { headers: corsHeaders });
-      } catch (err: any) {
-        console.error('History error', err);
-        return errorResponse(`数据库查询失败: ${err.message}`);
-      }
-    }
 
-    // POST /api/chat（流式版本）
-    if (path === '/api/chat' && request.method === 'POST') {
-      try {
-        await ensureTable(env.DB);
-      } catch (err: any) {
-        return errorResponse(`数据库初始化失败: ${err.message}`);
-      }
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let fullReply = '';
+        let finished = false;
 
-      let body: any;
-      try {
-        body = await request.json();
-      } catch {
-        return errorResponse('无效的 JSON', 400);
-      }
-      const { sessionId, message } = body;
-      if (!sessionId || !isValidSessionId(sessionId) || !message?.trim()) {
-        return errorResponse('缺少有效的 sessionId 或消息内容', 400);
-      }
-
-      // 限流检查
-      const rate = await checkRateLimit(env.KV_BINDING, sessionId);
-      if (!rate.allowed) {
-        return Response.json(
-          { error: '请求过于频繁，请稍后再试', retryAfter: rate.retryAfter },
-          { status: 429, headers: { ...corsHeaders, 'Retry-After': String(rate.retryAfter) } }
-        );
-      }
-
-      // 1. 保存用户消息
-      try {
-        await env.DB.prepare(`INSERT INTO messages (session_id, role, content) VALUES (?, 'user', ?)`)
-          .bind(sessionId, message.trim()).run();
-      } catch (err: any) {
-        console.error('Save user message error', err);
-        return errorResponse('保存用户消息失败');
-      }
-
-      // 2. 获取历史上下文（最多 CONTEXT_LIMIT 条）
-      const { results: history } = await env.DB.prepare(
-        `SELECT role, content FROM messages WHERE session_id = ? ORDER BY created_at ASC LIMIT ?`
-      ).bind(sessionId, CONTEXT_LIMIT).all();
-
-      const aiMessages = [
-        { role: 'system', content: SYSTEM_PROMPT },
-        ...(history as any[]).map(row => ({ role: row.role, content: row.content }))
-      ];
-
-      // 3. 调用流式 AI
-      let aiStream: ReadableStream;
-      try {
-        aiStream = await env.AI.run(AI_MODEL, { messages: aiMessages, stream: true }) as ReadableStream;
-      } catch (err: any) {
-        // 如果调用失败，需要删除刚才保存的用户消息
-        await env.DB.prepare(
-          `DELETE FROM messages WHERE session_id = ? AND id = (SELECT id FROM messages WHERE session_id = ? AND role = 'user' ORDER BY id DESC LIMIT 1)`
-        ).bind(sessionId, sessionId).run();
-        return errorResponse(`AI 流启动失败: ${err.message}`);
-      }
-
-      // 4. 创建 SSE 流，并处理保存完整回复到数据库（在流结束后）
-      const onComplete = async (fullReply: string) => {
-        if (!fullReply) fullReply = '抱歉，我无法生成回答。';
-        try {
-          await env.DB.prepare(`INSERT INTO messages (session_id, role, content) VALUES (?, 'assistant', ?)`)
-            .bind(sessionId, fullReply).run();
-          await updateSessionStats(env.KV_BINDING, sessionId);
-        } catch (err) {
-          console.error('Failed to save assistant reply', err);
+        while (!finished) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    const data = line.slice(6);
+                    if (data === '[DONE]') {
+                        finished = true;
+                        break;
+                    }
+                    try {
+                        const parsed = JSON.parse(data);
+                        if (parsed.content) {
+                            fullReply += parsed.content;
+                            appendOrUpdateAssistantMessage(parsed.content, false);
+                        }
+                    } catch (e) {}
+                }
+            }
         }
-      };
-
-      const sseStream = createSSEStream(aiStream, onComplete);
-
-      // 返回 SSE 响应
-      return new Response(sseStream, {
-        headers: {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive',
-          'Access-Control-Allow-Origin': '*',
-        },
-      });
+        if (fullReply) {
+            appendOrUpdateAssistantMessage(fullReply, true);
+        } else {
+            appendMessage('assistant', '抱歉，我没有收到回复。');
+        }
+    } catch (err) {
+        console.error(err);
+        appendMessage('assistant', '网络错误，请检查连接后重试');
+    } finally {
+        setLoading(false);
     }
+}
 
-    // 静态资源
-    return env.ASSETS.fetch(request);
-  },
-};
+function newChat() {
+    currentSessionId = generateUUID();
+    localStorage.setItem('chat_session_id', currentSessionId);
+    messagesArea.innerHTML = '';
+    appendMessage('assistant', '已开启全新会话！你可以开始提问了。');
+    scrollToBottom();
+}
+
+sendBtn.addEventListener('click', sendMessage);
+newChatBtn.addEventListener('click', newChat);
+userInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+    }
+});
+userInput.addEventListener('input', function() {
+    this.style.height = 'auto';
+    this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+});
+
+loadHistory();
