@@ -1,8 +1,8 @@
 // 全局变量
 let currentSessionId = localStorage.getItem('chat_session_id');
 let isLoading = false;
+let currentStreamController = null; // 用于中断请求（可选）
 
-// 生成标准 UUID v4
 function generateUUID() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
         const r = Math.random() * 16 | 0;
@@ -11,18 +11,15 @@ function generateUUID() {
     });
 }
 
-// 验证 UUID v4 格式
 function isValidUUID(id) {
     return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
 }
 
-// 初始化或校验 session
 if (!currentSessionId || !isValidUUID(currentSessionId)) {
     currentSessionId = generateUUID();
     localStorage.setItem('chat_session_id', currentSessionId);
 }
 
-// DOM 元素
 const messagesArea = document.getElementById('messagesArea');
 const userInput = document.getElementById('userInput');
 const sendBtn = document.getElementById('sendBtn');
@@ -38,13 +35,11 @@ if (typeof marked !== 'undefined') {
     });
 }
 
-// 安全渲染 Markdown
 function renderMarkdown(text) {
     if (typeof marked !== 'undefined' && typeof DOMPurify !== 'undefined') {
         const rawHtml = marked.parse(text);
         return DOMPurify.sanitize(rawHtml);
     }
-    // Fallback: 简单转义HTML标签
     return text.replace(/[&<>]/g, function(m) {
         if (m === '&') return '&amp;';
         if (m === '<') return '&lt;';
@@ -53,21 +48,62 @@ function renderMarkdown(text) {
     }).replace(/\n/g, '<br>');
 }
 
-// 添加消息到界面
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// 添加或更新最后的 assistant 消息（用于流式更新）
+let lastAssistantMessageDiv = null;
+
+function appendOrUpdateAssistantMessage(contentChunk, isComplete = false) {
+    if (!lastAssistantMessageDiv) {
+        // 创建新消息
+        const messageDiv = document.createElement('div');
+        messageDiv.className = 'message assistant';
+        messageDiv.innerHTML = `
+            <div class="avatar">🤖</div>
+            <div class="message-content">
+                <div class="bubble"></div>
+                <div class="timestamp">${new Date().toLocaleTimeString()}</div>
+            </div>
+        `;
+        messagesArea.appendChild(messageDiv);
+        lastAssistantMessageDiv = messageDiv;
+    }
+    const bubbleDiv = lastAssistantMessageDiv.querySelector('.bubble');
+    // 累积内容
+    let currentText = bubbleDiv.getAttribute('data-full-text') || '';
+    if (!isComplete) {
+        currentText += contentChunk;
+        bubbleDiv.setAttribute('data-full-text', currentText);
+        // 实时渲染 Markdown
+        bubbleDiv.innerHTML = renderMarkdown(currentText);
+    } else {
+        // 最终完整内容
+        currentText = contentChunk; // 用完整文本覆盖
+        bubbleDiv.innerHTML = renderMarkdown(currentText);
+        lastAssistantMessageDiv = null; // 重置，下次新消息重新创建
+    }
+    scrollToBottom();
+}
+
 function appendMessage(role, content, timestamp = null) {
+    if (role === 'assistant' && lastAssistantMessageDiv) {
+        // 如果有未完成的流式消息，先结束它（正常情况下不会发生）
+        lastAssistantMessageDiv = null;
+    }
     const messageDiv = document.createElement('div');
     messageDiv.className = `message ${role}`;
     const avatar = role === 'user' ? '👤' : '🤖';
     const timeStr = timestamp ? new Date(timestamp).toLocaleTimeString() : new Date().toLocaleTimeString();
-
-    // 如果是 assistant 消息，渲染 Markdown；用户消息只做简单换行
     let renderedContent;
     if (role === 'assistant') {
         renderedContent = renderMarkdown(content);
     } else {
         renderedContent = escapeHtml(content).replace(/\n/g, '<br>');
     }
-
     messageDiv.innerHTML = `
         <div class="avatar">${avatar}</div>
         <div class="message-content">
@@ -79,22 +115,10 @@ function appendMessage(role, content, timestamp = null) {
     scrollToBottom();
 }
 
-// 纯文本转义（用于用户消息）
-function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
-}
-
-// 加载历史消息
 async function loadHistory() {
     try {
         const res = await fetch(`/api/history?sessionId=${encodeURIComponent(currentSessionId)}`);
-        if (!res.ok) {
-            const errData = await res.json();
-            console.error('历史加载失败', errData);
-            return;
-        }
+        if (!res.ok) return;
         const { messages } = await res.json();
         if (messages && messages.length > 0) {
             messagesArea.innerHTML = '';
@@ -102,7 +126,6 @@ async function loadHistory() {
                 appendMessage(msg.role, msg.content, msg.created_at);
             }
         } else if (messagesArea.children.length === 0) {
-            // 没有历史且界面为空，显示欢迎语
             appendMessage('assistant', '你好！我是智能助手，基于 Llama 3 模型。有什么可以帮助你的吗？');
         }
         scrollToBottom();
@@ -111,12 +134,10 @@ async function loadHistory() {
     }
 }
 
-// 滚动到底部
 function scrollToBottom() {
     messagesArea.scrollTop = messagesArea.scrollHeight;
 }
 
-// 加载动画控制
 function setLoading(loading) {
     isLoading = loading;
     sendBtn.disabled = loading;
@@ -134,16 +155,17 @@ function setLoading(loading) {
     }
 }
 
-// 发送消息
 async function sendMessage() {
     const message = userInput.value.trim();
     if (!message || isLoading) return;
 
-    // 立即显示用户消息
     appendMessage('user', message);
     userInput.value = '';
     userInput.style.height = 'auto';
     setLoading(true);
+
+    // 重置流式消息引用
+    lastAssistantMessageDiv = null;
 
     try {
         const response = await fetch('/api/chat', {
@@ -151,13 +173,53 @@ async function sendMessage() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ sessionId: currentSessionId, message })
         });
-        const data = await response.json();
-        if (response.ok && data.response) {
-            appendMessage('assistant', data.response, data.timestamp);
-        } else {
-            let errMsg = data.error || '未知错误';
-            if (data.retryAfter) errMsg += ` (请 ${Math.ceil(data.retryAfter)} 秒后重试)`;
+
+        if (!response.ok) {
+            const errorData = await response.json();
+            let errMsg = errorData.error || '服务器错误';
+            if (errorData.retryAfter) errMsg += ` (请 ${Math.ceil(errorData.retryAfter)} 秒后重试)`;
             appendMessage('assistant', `❌ 出错：${errMsg}`);
+            setLoading(false);
+            return;
+        }
+
+        // 处理流式响应
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let fullReply = '';
+        let finished = false;
+
+        while (!finished) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    const data = line.slice(6);
+                    if (data === '[DONE]') {
+                        finished = true;
+                        break;
+                    }
+                    try {
+                        const parsed = JSON.parse(data);
+                        if (parsed.content) {
+                            fullReply += parsed.content;
+                            appendOrUpdateAssistantMessage(parsed.content, false);
+                        }
+                    } catch (e) {
+                        // 忽略解析错误
+                    }
+                }
+            }
+        }
+        // 最终完成，传入完整文本以更新最终渲染（确保 Markdown 完整）
+        if (fullReply) {
+            appendOrUpdateAssistantMessage(fullReply, true);
+        } else {
+            appendMessage('assistant', '抱歉，我没有收到回复。');
         }
     } catch (err) {
         console.error(err);
@@ -167,7 +229,6 @@ async function sendMessage() {
     }
 }
 
-// 新建会话
 function newChat() {
     currentSessionId = generateUUID();
     localStorage.setItem('chat_session_id', currentSessionId);
@@ -176,7 +237,6 @@ function newChat() {
     scrollToBottom();
 }
 
-// 事件绑定
 sendBtn.addEventListener('click', sendMessage);
 newChatBtn.addEventListener('click', newChat);
 userInput.addEventListener('keydown', (e) => {
@@ -185,11 +245,9 @@ userInput.addEventListener('keydown', (e) => {
         sendMessage();
     }
 });
-// 自动调整 textarea 高度
 userInput.addEventListener('input', function() {
     this.style.height = 'auto';
     this.style.height = Math.min(this.scrollHeight, 120) + 'px';
 });
 
-// 启动时加载历史
 loadHistory();
