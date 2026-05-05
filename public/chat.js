@@ -58,6 +58,7 @@ function escapeHtml(text) {
 let lastAssistantMessageDiv = null;
 
 function appendOrUpdateAssistantMessage(contentChunk, isComplete = false) {
+    if (!contentChunk && !isComplete) return; // 忽略空块
     if (!lastAssistantMessageDiv) {
         const messageDiv = document.createElement('div');
         messageDiv.className = 'message assistant';
@@ -78,8 +79,9 @@ function appendOrUpdateAssistantMessage(contentChunk, isComplete = false) {
         bubbleDiv.setAttribute('data-full-text', currentText);
         bubbleDiv.innerHTML = renderMarkdown(currentText);
     } else {
-        currentText = contentChunk;
-        bubbleDiv.innerHTML = renderMarkdown(currentText);
+        // 最终完整内容，直接使用 contentChunk（可能是 fullReply）
+        const finalText = contentChunk || currentText;
+        bubbleDiv.innerHTML = renderMarkdown(finalText);
         lastAssistantMessageDiv = null;
     }
     scrollToBottom();
