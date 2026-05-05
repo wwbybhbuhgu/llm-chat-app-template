@@ -14,23 +14,17 @@ const RATE_LIMIT = 10;
 const RATE_WINDOW = 60;
 const KV_TTL_BUFFER = 5;
 
-const initSQL = `
-CREATE TABLE IF NOT EXISTS messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id TEXT NOT NULL,
-  role TEXT NOT NULL,
-  content TEXT NOT NULL,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_session_id ON messages(session_id);
-`;
+// 修复：拆分为单行SQL，避免多行字符串导致的解析错误
+const CREATE_TABLE_SQL = "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)";
+const CREATE_INDEX_SQL = "CREATE INDEX IF NOT EXISTS idx_session_id ON messages(session_id)";
 
 function isValidSessionId(id: string): boolean {
   return /^[a-zA-Z0-9\-_]{20,40}$/.test(id);
 }
 
 async function ensureTable(db: D1Database) {
-  await db.exec(initSQL);
+  await db.exec(CREATE_TABLE_SQL);
+  await db.exec(CREATE_INDEX_SQL);
 }
 
 async function checkRateLimit(kv: KVNamespace, sessionId: string) {
@@ -68,7 +62,7 @@ async function updateSessionStats(kv: KVNamespace, sessionId: string) {
   ]);
 }
 
-// 可靠的流处理：直接读取AI返回的每个完整JSON行，累积回复并转发给前端
+// 可靠流处理
 function createSSEStream(
   aiStream: ReadableStream,
   onComplete: (fullText: string) => Promise<void>
@@ -84,7 +78,6 @@ function createSSEStream(
           const { done, value } = await reader.read();
           if (done) break;
 
-          // Cloudflare Workers AI 流式返回的是 UTF-8 文本，每个 chunk 可能是一个完整的 JSON 行
           const chunkStr = new TextDecoder().decode(value);
           try {
             const json = JSON.parse(chunkStr);
@@ -94,17 +87,14 @@ function createSSEStream(
               controller.enqueue(encoder.encode(`data: ${JSON.stringify({ content })}\n\n`));
             }
           } catch {
-            // 忽略无法解析的分片（理论上不会发生，但防御）
             continue;
           }
         }
       } catch (err) {
         console.error('Stream read error:', err);
       } finally {
-        // 始终发送结束标记
         controller.enqueue(encoder.encode('data: [DONE]\n\n'));
         controller.close();
-        // 异步保存完整回复到数据库（即使流出错，也会尝试保存已有文本）
         await onComplete(fullText || '抱歉，生成回答失败。');
       }
     },
@@ -119,7 +109,6 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // 预检 OPTIONS
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         status: 204,
@@ -188,7 +177,6 @@ export default {
         return errorResponse('缺少有效的 sessionId 或消息内容', 400);
       }
 
-      // 限流
       const rate = await checkRateLimit(env.KV_BINDING, sessionId);
       if (!rate.allowed) {
         return Response.json(
@@ -221,12 +209,10 @@ export default {
         `).bind(sessionId, CONTEXT_LIMIT).all();
         historyRows = results as any[];
       } catch (err: any) {
-        // 回滚用户消息
         if (userMsgId) await env.DB.prepare(`DELETE FROM messages WHERE id = ?`).bind(userMsgId).run();
         return errorResponse('获取对话上下文失败');
       }
 
-      // 组装 AI 消息（系统提示 + 历史）
       const aiMessages = [
         { role: 'system', content: SYSTEM_PROMPT },
         ...historyRows
@@ -240,14 +226,12 @@ export default {
           stream: true
         }) as ReadableStream;
       } catch (err: any) {
-        // 失败时删除用户消息
         if (userMsgId) {
           await env.DB.prepare(`DELETE FROM messages WHERE id = ?`).bind(userMsgId).run();
         }
         return errorResponse(`AI 模型调用失败: ${err.message}`);
       }
 
-      // 流结束后保存助手回复
       const onComplete = async (fullReply: string) => {
         try {
           await env.DB.prepare(`
@@ -274,7 +258,6 @@ export default {
       });
     }
 
-    // 静态资源
     return env.ASSETS.fetch(request);
   },
 };
