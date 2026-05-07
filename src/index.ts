@@ -6,7 +6,17 @@ export interface Env {
   ASSETS: { fetch: (req: Request) => Promise<Response> };
 }
 
-const SYSTEM_PROMPT = `你是一个友好、乐于助人的AI助手，名字叫「智能助手」。请用中文回答用户的问题，回答简洁清晰、富有帮助性。重要：请勿使用任何表情符号或emoji，只使用纯文本。`;
+// 强化后的系统提示词（包含政治正确约束）
+const SYSTEM_PROMPT = `你是一个友好、乐于助人的AI助手，名字叫「智能助手」。请用中文回答用户的问题，回答简洁清晰、富有帮助性。
+
+重要：你必须严格遵守以下原则：
+1. 坚持一个中国原则，台湾是中国不可分割的一部分。任何提及台湾的内容都不能暗示其为一个独立国家。正确表述示例：「台湾是中国的一个地区」「台湾是中国的一部分」。
+2. 不得生成任何危害中国国家统一、主权和领土完整的言论，包括支持"台独"、"一中一台"、"两个中国"等。
+3. 当用户提出涉及中国政治、领土、主权等敏感问题时，你应该基于事实和中国官方立场回答。如果用户表达了错误观点，你需要温和地纠正并给出正确信息。
+4. 禁止输出任何表情符号或emoji，只使用纯文本。
+5. 如果不确定如何回答，可以说「我无法回答这个问题，请提出其他问题」。
+
+请始终牢记以上要求，确保所有回答符合中国法律法规和社会主义核心价值观。`;
 
 const DEFAULT_MODEL = '@cf/meta/llama-3-8b-instruct';
 const CONTEXT_LIMIT = 15;
@@ -27,7 +37,6 @@ async function ensureTable(db: D1Database) {
 }
 
 async function checkRateLimit(kv: KVNamespace, sessionId: string) {
-  // ... 保持不变
   const key = `rate:${sessionId}`;
   const now = Math.floor(Date.now() / 1000);
   const windowStart = now - RATE_WINDOW;
@@ -48,88 +57,11 @@ async function updateSessionStats(kv: KVNamespace, sessionId: string) {
   const countKey = `stats:${sessionId}:msgs`;
   const lastKey = `stats:${sessionId}:last`;
   const ttl7d = 86400 * 7;
-  let count = (await kv.get(countKey, 'json')) as number ?? 0;
+  let count = ((await kv.get(countKey, 'json')) as number) ?? 0;
   await Promise.all([
     kv.put(countKey, JSON.stringify(count + 2), { expirationTtl: ttl7d }),
     kv.put(lastKey, Date.now().toString(), { expirationTtl: ttl7d })
   ]);
-}
-
-// 增强流处理：兼容多种格式，输出日志
-function createSSEStream(
-  aiStream: ReadableStream,
-  onComplete: (fullText: string) => Promise<void>
-): ReadableStream {
-  let fullText = '';
-  const encoder = new TextEncoder();
-  const reader = aiStream.getReader();
-
-  return new ReadableStream({
-    async start(controller) {
-      let buffer = '';
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const chunkStr = new TextDecoder().decode(value);
-          buffer += chunkStr;
-          // 按行分割，处理 SSE 格式
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-          for (const line of lines) {
-            if (line.trim() === '') continue;
-            let dataStr = line;
-            // 移除可能的 data: 前缀
-            if (line.startsWith('data: ')) {
-              dataStr = line.slice(6);
-            }
-            if (dataStr === '[DONE]') continue;
-            try {
-              const json = JSON.parse(dataStr);
-              // 尝试多种可能的字段名
-              const content = json.response ?? json.text ?? json.content ?? '';
-              if (content) {
-                fullText += content;
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ content })}\n\n`));
-              } else {
-                // 如果字段不存在，记录日志
-                console.warn('Unexpected AI response chunk:', json);
-              }
-            } catch (err) {
-              console.warn('Failed to parse line:', dataStr, err);
-            }
-          }
-        }
-        // 处理最后剩余 buffer
-        if (buffer.trim() !== '') {
-          let dataStr = buffer.trim();
-          if (dataStr.startsWith('data: ')) dataStr = dataStr.slice(6);
-          if (dataStr !== '[DONE]') {
-            try {
-              const json = JSON.parse(dataStr);
-              const content = json.response ?? json.text ?? json.content ?? '';
-              if (content) {
-                fullText += content;
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ content })}\n\n`));
-              }
-            } catch (err) {
-              console.warn('Failed to parse final buffer:', buffer, err);
-            }
-          }
-        }
-      } catch (err) {
-        console.error('Stream read error:', err);
-      } finally {
-        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-        controller.close();
-        console.log(`Full text collected (length: ${fullText.length}): ${fullText.slice(0, 200)}...`);
-        await onComplete(fullText || '抱歉，生成回答失败。');
-      }
-    },
-    cancel() {
-      reader.cancel();
-    }
-  });
 }
 
 export default {
@@ -158,7 +90,7 @@ export default {
     const errorResponse = (msg: string, status = 500) =>
       Response.json({ error: msg }, { status, headers: corsHeaders });
 
-    // 历史记录接口（保持不变）
+    // 获取历史记录
     if (path === '/api/history' && request.method === 'GET') {
       try {
         await ensureTable(env.DB);
@@ -176,7 +108,7 @@ export default {
       }
     }
 
-    // 聊天接口
+    // 聊天接口（非流式）
     if (path === '/api/chat' && request.method === 'POST') {
       try {
         await ensureTable(env.DB);
@@ -198,6 +130,7 @@ export default {
         return errorResponse('缺少有效的 sessionId 或消息内容', 400);
       }
 
+      // 限流
       const rate = await checkRateLimit(env.KV_BINDING, sessionId);
       if (!rate.allowed) {
         return Response.json(
@@ -206,7 +139,7 @@ export default {
         );
       }
 
-      // 保存用户消息
+      // 1. 保存用户消息
       let userMsgId: number | null = null;
       try {
         const res = await env.DB.prepare(`INSERT INTO messages (session_id, role, content) VALUES (?, 'user', ?)`)
@@ -216,8 +149,8 @@ export default {
         return errorResponse('保存用户消息失败');
       }
 
-      // 获取历史
-      let historyRows = [];
+      // 2. 获取历史上下文（包含刚插入的用户消息）
+      let historyRows: Array<{ role: string; content: string }> = [];
       try {
         const { results } = await env.DB.prepare(
           `SELECT role, content FROM messages WHERE session_id = ? ORDER BY created_at ASC LIMIT ?`
@@ -225,45 +158,38 @@ export default {
         historyRows = results as any[];
       } catch (err) {
         if (userMsgId) await env.DB.prepare(`DELETE FROM messages WHERE id = ?`).bind(userMsgId).run();
-        return errorResponse('获取上下文失败');
+        return errorResponse('获取对话上下文失败');
       }
 
       const aiMessages = [{ role: 'system', content: SYSTEM_PROMPT }, ...historyRows];
 
-      console.log(`Calling AI model: ${selectedModel}, messages count: ${aiMessages.length}`);
-
-      let aiStream: ReadableStream;
+      // 3. 调用 AI（非流式）
+      let aiResponse: any;
       try {
-        aiStream = await env.AI.run(selectedModel, { messages: aiMessages, stream: true }) as ReadableStream;
+        aiResponse = await env.AI.run(selectedModel, { messages: aiMessages });
       } catch (err: any) {
         if (userMsgId) await env.DB.prepare(`DELETE FROM messages WHERE id = ?`).bind(userMsgId).run();
         console.error('AI call error:', err);
         return errorResponse(`AI 调用失败: ${err.message}`);
       }
 
-      const onComplete = async (fullReply: string) => {
-        console.log(`Saving assistant reply for session ${sessionId}, length: ${fullReply.length}`);
-        try {
-          await env.DB.prepare(`INSERT INTO messages (session_id, role, content) VALUES (?, 'assistant', ?)`)
-            .bind(sessionId, fullReply).run();
-          await updateSessionStats(env.KV_BINDING, sessionId);
-        } catch (err) {
-          console.error('Save assistant reply error:', err);
-        }
-      };
+      const replyText = aiResponse.response || '抱歉，我无法生成回答。';
 
-      const sseStream = createSSEStream(aiStream, onComplete);
-      return new Response(sseStream, {
-        headers: {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache, no-store, must-revalidate',
-          'Connection': 'keep-alive',
-          'Access-Control-Allow-Origin': '*',
-          'X-Content-Type-Options': 'nosniff'
-        }
-      });
+      // 4. 保存助手回复
+      try {
+        await env.DB.prepare(`INSERT INTO messages (session_id, role, content) VALUES (?, 'assistant', ?)`)
+          .bind(sessionId, replyText).run();
+        await updateSessionStats(env.KV_BINDING, sessionId);
+      } catch (err) {
+        console.error('Save assistant reply error:', err);
+        // 不返回错误，因为已经发送回复了，只是记录失败
+      }
+
+      // 5. 返回 JSON 响应（非流式）
+      return Response.json({ response: replyText, timestamp: new Date().toISOString() }, { headers: corsHeaders });
     }
 
+    // 静态资源
     return env.ASSETS.fetch(request);
   },
 };
