@@ -1,7 +1,6 @@
 // 全局变量
 let currentSessionId = localStorage.getItem('chat_session_id');
 let isLoading = false;
-let currentStreamController = null;
 
 function generateUUID() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
@@ -26,7 +25,6 @@ const sendBtn = document.getElementById('sendBtn');
 const newChatBtn = document.getElementById('newChatBtn');
 const modelSelect = document.getElementById('modelSelect');
 
-// 配置 marked
 if (typeof marked !== 'undefined') {
     marked.setOptions({
         breaks: true,
@@ -55,42 +53,7 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-let lastAssistantMessageDiv = null;
-
-function appendOrUpdateAssistantMessage(contentChunk, isComplete = false) {
-    if (!contentChunk && !isComplete) return; // 忽略空块
-    if (!lastAssistantMessageDiv) {
-        const messageDiv = document.createElement('div');
-        messageDiv.className = 'message assistant';
-        messageDiv.innerHTML = `
-            <div class="avatar">A</div>
-            <div class="message-content">
-                <div class="bubble"></div>
-                <div class="timestamp">${new Date().toLocaleTimeString()}</div>
-            </div>
-        `;
-        messagesArea.appendChild(messageDiv);
-        lastAssistantMessageDiv = messageDiv;
-    }
-    const bubbleDiv = lastAssistantMessageDiv.querySelector('.bubble');
-    let currentText = bubbleDiv.getAttribute('data-full-text') || '';
-    if (!isComplete) {
-        currentText += contentChunk;
-        bubbleDiv.setAttribute('data-full-text', currentText);
-        bubbleDiv.innerHTML = renderMarkdown(currentText);
-    } else {
-        // 最终完整内容，直接使用 contentChunk（可能是 fullReply）
-        const finalText = contentChunk || currentText;
-        bubbleDiv.innerHTML = renderMarkdown(finalText);
-        lastAssistantMessageDiv = null;
-    }
-    scrollToBottom();
-}
-
 function appendMessage(role, content, timestamp = null) {
-    if (role === 'assistant' && lastAssistantMessageDiv) {
-        lastAssistantMessageDiv = null;
-    }
     const messageDiv = document.createElement('div');
     messageDiv.className = `message ${role}`;
     const avatarText = role === 'user' ? 'U' : 'A';
@@ -161,64 +124,27 @@ async function sendMessage() {
     userInput.style.height = 'auto';
     setLoading(true);
 
-    lastAssistantMessageDiv = null;
-
-    // 获取选中的模型
     const selectedModel = modelSelect.value;
 
     try {
         const response = await fetch('/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
-                sessionId: currentSessionId, 
-                message,
+            body: JSON.stringify({
+                sessionId: currentSessionId,
+                message: message,
                 model: selectedModel
             })
         });
 
-        if (!response.ok) {
-            const errorData = await response.json();
-            let errMsg = errorData.error || '服务器错误';
-            if (errorData.retryAfter) errMsg += ` (请 ${Math.ceil(errorData.retryAfter)} 秒后重试)`;
-            appendMessage('assistant', `出错：${errMsg}`);
-            setLoading(false);
-            return;
-        }
+        const data = await response.json();
 
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        let fullReply = '';
-        let finished = false;
-
-        while (!finished) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop() || '';
-            for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                    const data = line.slice(6);
-                    if (data === '[DONE]') {
-                        finished = true;
-                        break;
-                    }
-                    try {
-                        const parsed = JSON.parse(data);
-                        if (parsed.content) {
-                            fullReply += parsed.content;
-                            appendOrUpdateAssistantMessage(parsed.content, false);
-                        }
-                    } catch (e) {}
-                }
-            }
-        }
-        if (fullReply) {
-            appendOrUpdateAssistantMessage(fullReply, true);
+        if (response.ok && data.response) {
+            appendMessage('assistant', data.response, data.timestamp);
         } else {
-            appendMessage('assistant', '抱歉，我没有收到回复。');
+            let errMsg = data.error || '服务器错误';
+            if (data.retryAfter) errMsg += ` (请 ${Math.ceil(data.retryAfter)} 秒后重试)`;
+            appendMessage('assistant', `出错：${errMsg}`);
         }
     } catch (err) {
         console.error(err);
