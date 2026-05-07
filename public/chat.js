@@ -54,7 +54,42 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
+let lastAssistantMessageDiv = null;
+
+function appendOrUpdateAssistantMessage(contentChunk, isComplete = false) {
+    if (!isComplete && (!contentChunk || contentChunk === '')) return;
+    if (!lastAssistantMessageDiv) {
+        const messageDiv = document.createElement('div');
+        messageDiv.className = 'message assistant';
+        messageDiv.innerHTML = `
+            <div class="avatar">A</div>
+            <div class="message-content">
+                <div class="bubble"></div>
+                <div class="timestamp">${new Date().toLocaleTimeString()}</div>
+            </div>
+        `;
+        messagesArea.appendChild(messageDiv);
+        lastAssistantMessageDiv = messageDiv;
+    }
+    const bubbleDiv = lastAssistantMessageDiv.querySelector('.bubble');
+    let currentText = bubbleDiv.getAttribute('data-full-text') || '';
+    if (!isComplete) {
+        currentText += contentChunk;
+        bubbleDiv.setAttribute('data-full-text', currentText);
+        bubbleDiv.innerHTML = renderMarkdown(currentText);
+    } else {
+        const finalText = contentChunk || currentText;
+        bubbleDiv.innerHTML = renderMarkdown(finalText);
+        lastAssistantMessageDiv = null;
+    }
+    scrollToBottom();
+}
+
 function appendMessage(role, content, timestamp = null) {
+    if (role === 'assistant' && lastAssistantMessageDiv) {
+        // 如果有未完成的流式消息，先结束它（正常情况下不会发生）
+        lastAssistantMessageDiv = null;
+    }
     const messageDiv = document.createElement('div');
     messageDiv.className = `message ${role}`;
     const avatarText = role === 'user' ? 'U' : 'A';
@@ -130,7 +165,6 @@ async function loadModels() {
             option.textContent = model.name;
             select.appendChild(option);
         }
-        // 恢复上次选择的模型
         const lastModel = localStorage.getItem('selected_model');
         if (lastModel && Array.from(select.options).some(opt => opt.value === lastModel)) {
             select.value = lastModel;
@@ -142,7 +176,6 @@ async function loadModels() {
     }
 }
 
-// 保存用户选择的模型
 modelSelect.addEventListener('change', () => {
     localStorage.setItem('selected_model', modelSelect.value);
 });
@@ -155,6 +188,7 @@ async function sendMessage() {
     userInput.value = '';
     userInput.style.height = 'auto';
     setLoading(true);
+    lastAssistantMessageDiv = null;
 
     const selectedModel = modelSelect.value;
 
@@ -169,14 +203,57 @@ async function sendMessage() {
             })
         });
 
-        const data = await response.json();
-
-        if (response.ok && data.response) {
-            appendMessage('assistant', data.response, data.timestamp);
-        } else {
-            let errMsg = data.error || '服务器错误';
-            if (data.retryAfter) errMsg += ` (请 ${Math.ceil(data.retryAfter)} 秒后重试)`;
+        if (!response.ok) {
+            const errorData = await response.json();
+            let errMsg = errorData.error || '服务器错误';
+            if (errorData.retryAfter) errMsg += ` (请 ${Math.ceil(errorData.retryAfter)} 秒后重试)`;
             appendMessage('assistant', `出错：${errMsg}`);
+            setLoading(false);
+            return;
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let finished = false;
+
+        while (!finished) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    const data = line.slice(6);
+                    if (data === '[DONE]') {
+                        finished = true;
+                        break;
+                    }
+                    try {
+                        const parsed = JSON.parse(data);
+                        if (parsed.content) {
+                            appendOrUpdateAssistantMessage(parsed.content, false);
+                        } else if (parsed.error) {
+                            appendMessage('assistant', `出错：${parsed.error}`);
+                            finished = true;
+                            break;
+                        }
+                    } catch (e) {
+                        // 忽略解析错误
+                    }
+                }
+            }
+        }
+        // 确保最终完整渲染（流结束后可能没有收到 [DONE] 但数据已经完整）
+        if (lastAssistantMessageDiv) {
+            const bubbleDiv = lastAssistantMessageDiv.querySelector('.bubble');
+            const finalText = bubbleDiv.getAttribute('data-full-text') || '';
+            if (finalText) {
+                appendOrUpdateAssistantMessage(finalText, true);
+            } else {
+                lastAssistantMessageDiv = null;
+            }
         }
     } catch (err) {
         console.error(err);
@@ -207,5 +284,5 @@ userInput.addEventListener('input', function() {
     this.style.height = Math.min(this.scrollHeight, 120) + 'px';
 });
 
-// 并行加载模型和历史
+// 初始化
 Promise.all([loadModels(), loadHistory()]).catch(console.error);
