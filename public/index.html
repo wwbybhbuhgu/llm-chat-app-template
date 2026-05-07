@@ -5,7 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
     <title>AI 智能助手 · Cloudflare Workers</title>
     <link rel="stylesheet" href="/style.css">
-    <!-- Markdown 渲染与安全过滤 -->
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 </head>
@@ -14,20 +13,11 @@
         <div class="chat-header">
             <div class="title">
                 <h1>AI 智能助手</h1>
-                <span class="badge">Cloudflare Workers · 流式输出 · 多模型</span>
+                <span class="badge">Cloudflare Workers · 多模型</span>
             </div>
             <div class="header-actions">
                 <select id="modelSelect" class="model-select">
-                    <!-- 低成本模型优先排列 -->
-                    <option value="@cf/openai/gpt-5.4-pro">OpenAI GPT-5.4 Pro</option>
-                    <option value="@hf/google/gemma-7b-it">Google Gemma 7B Instruct</option>
-                    <option value="@cf/minimax/m2.7">Minimax M2.7</option>
-                    <option value="@cf/alibaba/qwen3-max">Alibaba Qwen3-Max</option>
-                    <!-- 其他常用模型 -->
-                    <option value="@cf/meta/llama-3-8b-instruct" selected>Llama 3 8B Instruct</option>
-                    <option value="@cf/mistral/mistral-7b-instruct-v0.1">Mistral 7B Instruct</option>
-                    <option value="@hf/thebloke/deepseek-coder-6.7b-instruct-awq">DeepSeek Coder 6.7B</option>
-                    <option value="@cf/meta/llama-2-7b-chat-int8">Llama 2 7B Chat</option>
+                    <option value="">加载模型中...</option>
                 </select>
                 <button class="new-chat-btn" id="newChatBtn">新会话</button>
             </div>
