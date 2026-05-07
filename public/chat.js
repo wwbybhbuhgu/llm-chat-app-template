@@ -25,6 +25,7 @@ const sendBtn = document.getElementById('sendBtn');
 const newChatBtn = document.getElementById('newChatBtn');
 const modelSelect = document.getElementById('modelSelect');
 
+// 配置 marked
 if (typeof marked !== 'undefined') {
     marked.setOptions({
         breaks: true,
@@ -115,6 +116,37 @@ function setLoading(loading) {
     }
 }
 
+// 动态加载模型列表
+async function loadModels() {
+    try {
+        const res = await fetch('/api/models');
+        if (!res.ok) throw new Error('Failed to load models');
+        const { models } = await res.json();
+        const select = document.getElementById('modelSelect');
+        select.innerHTML = '';
+        for (const model of models) {
+            const option = document.createElement('option');
+            option.value = model.id;
+            option.textContent = model.name;
+            select.appendChild(option);
+        }
+        // 恢复上次选择的模型
+        const lastModel = localStorage.getItem('selected_model');
+        if (lastModel && Array.from(select.options).some(opt => opt.value === lastModel)) {
+            select.value = lastModel;
+        }
+    } catch (err) {
+        console.error('加载模型列表失败', err);
+        const select = document.getElementById('modelSelect');
+        select.innerHTML = '<option value="@cf/meta/llama-3-8b-instruct">Llama 3 8B Instruct (默认)</option>';
+    }
+}
+
+// 保存用户选择的模型
+modelSelect.addEventListener('change', () => {
+    localStorage.setItem('selected_model', modelSelect.value);
+});
+
 async function sendMessage() {
     const message = userInput.value.trim();
     if (!message || isLoading) return;
@@ -175,4 +207,5 @@ userInput.addEventListener('input', function() {
     this.style.height = Math.min(this.scrollHeight, 120) + 'px';
 });
 
-loadHistory();
+// 并行加载模型和历史
+Promise.all([loadModels(), loadHistory()]).catch(console.error);
