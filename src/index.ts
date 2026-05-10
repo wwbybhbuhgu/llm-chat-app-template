@@ -41,12 +41,10 @@ const KV_TTL_BUFFER = 5;
 // 建表语句
 const CREATE_TABLE_SQL = "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)";
 const CREATE_INDEX_SQL = "CREATE INDEX IF NOT EXISTS idx_session_id ON messages(session_id)";
-const CREATE_TABLE_AI_RESPONSES_SQL = "CREATE TABLE IF NOT EXISTS ai_responses (session_id TEXT PRIMARY KEY, full_content TEXT NOT NULL, is_complete BOOLEAN DEFAULT 0)";
 
 async function ensureTable(db: D1Database) {
   await db.exec(CREATE_TABLE_SQL).catch(err => console.error('建表失败:', err));
   await db.exec(CREATE_INDEX_SQL).catch(err => console.error('建索引失败:', err));
-  await db.exec(CREATE_TABLE_AI_RESPONSES_SQL).catch(err => console.error('AI 回复表建表失败:', err));
 }
 
 function isValidSessionId(id: string): boolean {
@@ -275,7 +273,8 @@ export default {
       const aiMessages = [{ role: 'system', content: SYSTEM_PROMPT }, ...historyRows];
       const isExternal = EXTERNAL_MODELS.has(selectedModel);
 
-      // 3. 获取 AI 流
+      // 3. 获取 AI 流并拼接完整回复（流式收集）
+      let fullReply = '';
       let tokenGen: AsyncGenerator<string>;
       try {
         if (isExternal) {
@@ -304,19 +303,7 @@ export default {
         return errorResponse(`AI 调用失败：${err.message}`);
       }
 
-      // 4. 创建占位回复记录
-      let responseRecordId: number | null = null;
-      try {
-        const res = await env.DB.prepare(
-          `INSERT INTO ai_responses (session_id, full_content, is_complete) VALUES (?, '', 0)`
-        ).bind(sessionId).run();
-        responseRecordId = res.meta.last_row_id;
-      } catch (err) {
-        console.error('创建回复记录失败:', err);
-      }
-
-      // 5. 流式收集并发送 token
-      let fullReply = '';
+      // 4. 创建 SSE 流发送 token（不保存 AI 回复，仅流式输出）
       const encoder = new TextEncoder();
       const sseStream = new ReadableStream({
         async start(controller) {
@@ -324,33 +311,18 @@ export default {
             for await (const token of tokenGen) {
               fullReply += token;
               controller.enqueue(encoder.encode(`data: ${JSON.stringify({ content: token })}\n\n`));
-              
-              // 每收到 50 个字符就更新一次数据库
-              if (fullReply.length > 50 && fullReply.length % 50 === 0) {
-                ctx.waitUntil(
-                  env.DB.prepare(
-                    `UPDATE ai_responses SET full_content = ?, is_complete = 0 WHERE session_id = ?`
-                  ).bind(fullReply, sessionId).run()
-                );
-              }
             }
           } catch (err) {
             console.error('Streaming error:', err);
             controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: '流式传输中断' })}\n\n`));
           } finally {
-            // 流结束，标记为完成并保存最终内容
-            ctx.waitUntil(
-              env.DB.prepare(
-                `UPDATE ai_responses SET full_content = ?, is_complete = 1 WHERE session_id = ?`
-              ).bind(fullReply || '抱歉，我无法生成回答。', sessionId).run()
-            );
             controller.enqueue(encoder.encode('data: [DONE]\n\n'));
             controller.close();
           }
         },
       });
 
-      // 返回 SSE 响应
+      // 5. 返回 SSE 响应
       return new Response(sseStream, {
         headers: {
           'Content-Type': 'text/event-stream',
@@ -359,6 +331,37 @@ export default {
           ...corsHeaders,
         },
       });
+    }
+
+    // 保存 AI 助手回复（由前端在接收完整回复后调用）
+    if (path === '/api/save-ai-reply' && request.method === 'POST') {
+      try {
+        await ensureTable(env.DB);
+        let body: any;
+        try {
+          body = await request.json();
+        } catch {
+          return errorResponse('无效 JSON', 400);
+        }
+        const { sessionId, reply } = body;
+        
+        if (!sessionId || !isValidSessionId(sessionId) || !reply) {
+          return errorResponse('缺少有效的 sessionId 或回复内容', 400);
+        }
+
+        try {
+          await env.DB.prepare(`INSERT INTO messages (session_id, role, content) VALUES (?, 'assistant', ?)`)
+            .bind(sessionId, reply).run();
+          await updateSessionStats(env.KV_BINDING, sessionId);
+          console.log(`已保存助手消息，长度 ${reply.length}`);
+        } catch (err: any) {
+          return errorResponse('保存助手回复失败');
+        }
+
+        return Response.json({ success: true }, { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      } catch (err: any) {
+        return errorResponse(`数据库错误：${err.message}`);
+      }
     }
 
     // 静态资源

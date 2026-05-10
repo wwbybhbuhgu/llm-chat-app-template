@@ -245,12 +245,16 @@ async function sendMessage() {
                 }
             }
         }
-        // 确保最终完整渲染（流结束后可能没有收到 [DONE] 但数据已经完整）
+
+        // 确保最终完整渲染并保存 AI 回复到数据库
         if (lastAssistantMessageDiv) {
             const bubbleDiv = lastAssistantMessageDiv.querySelector('.bubble');
             const finalText = bubbleDiv.getAttribute('data-full-text') || '';
             if (finalText) {
                 appendOrUpdateAssistantMessage(finalText, true);
+                // 发送完整回复到服务器保存
+                saveAiReplyToServer(finalText.trim());
+                lastAssistantMessageDiv = null;
             } else {
                 lastAssistantMessageDiv = null;
             }
@@ -260,6 +264,27 @@ async function sendMessage() {
         appendMessage('assistant', '网络错误，请检查连接后重试');
     } finally {
         setLoading(false);
+    }
+}
+
+// 将 AI 回复保存到服务器（由前端在接收完整回复后调用）
+async function saveAiReplyToServer(reply) {
+    try {
+        const res = await fetch('/api/save-ai-reply', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                sessionId: currentSessionId,
+                reply: reply
+            })
+        });
+        if (!res.ok) {
+            console.error('保存 AI 回复失败:', await res.text());
+        } else {
+            console.log('AI 回复已保存');
+        }
+    } catch (err) {
+        console.error('保存 AI 回复异常:', err);
     }
 }
 
