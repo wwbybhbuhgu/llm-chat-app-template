@@ -131,9 +131,9 @@ async function loadHistory() {
         if (!res.ok) return;
         const { messages } = await res.json();
         if (messages && messages.length > 0) {
-            chatHistory = []; // 清空并重建历史记录
+            fullSessionMessages = []; // 清空并重建完整的会话消息
             for (const msg of messages) {
-                chatHistory.push({
+                fullSessionMessages.push({
                     role: msg.role,
                     content: msg.content
                 });
@@ -211,6 +211,9 @@ async function sendMessage() {
     const selectedModel = modelSelect.value;
 
     try {
+        // 构建完整的上下文（历史消息 + 当前用户消息）
+        const contextToSend = [...fullSessionMessages, { role: 'user', content: message }];
+
         // 发送消息时带上完整的上下文历史
         const response = await fetch('/api/chat', {
             method: 'POST',
@@ -219,7 +222,7 @@ async function sendMessage() {
                 sessionId: currentSessionId,
                 message: message,
                 model: selectedModel,
-                context: chatHistory // 把前端维护的上下文传给后端
+                context: contextToSend // 把前端维护的上下文传给后端
             })
         });
 
