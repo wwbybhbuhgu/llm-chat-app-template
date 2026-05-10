@@ -1,153 +1,176 @@
-# LLM Chat Application Template
+# AI 智能助手聊天应用
 
-A simple, ready-to-deploy chat application template powered by Cloudflare Workers AI. This template provides a clean starting point for building AI chat applications with streaming responses.
+基于 Cloudflare Workers + D1 + KV 的多模型 AI 聊天应用，支持流式响应和历史记录管理。
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cloudflare/templates/tree/main/llm-chat-app-template)
+## ✨ 特性
 
-<!-- dash-content-start -->
+- 🤖 **多模型支持** - 内置 Llama 3, Mistral, Qwen 等多个大语言模型
+- ⚡ **流式响应** - Server-Sent Events (SSE) 实时推送 AI 回复
+- 💾 **持久化存储** - D1 数据库存储对话历史，KV 限流保护
+- 🔒 **安全过滤** - 集成爱国主题系统提示词，确保内容合规
+- 📱 **响应式设计** - 移动端友好界面
+- 🌐 **本地资源** - CDN 资源本地化，减少网络请求
 
-## Demo
+## 🛠️ 技术栈
 
-This template demonstrates how to build an AI-powered chat interface using Cloudflare Workers AI with streaming responses. It features:
+- **后端**: Cloudflare Workers (TypeScript)
+- **数据库**: Cloudflare D1
+- **缓存/限流**: Cloudflare KV
+- **AI**: Cloudflare Workers AI / DMX API 网关
+- **前端**: HTML/CSS/Vanilla JavaScript
 
-- Real-time streaming of AI responses using Server-Sent Events (SSE)
-- Easy customization of models and system prompts
-- Support for AI Gateway integration
-- Clean, responsive UI that works on mobile and desktop
+## 📦 快速开始
 
-## Features
-
-- 💬 Simple and responsive chat interface
-- ⚡ Server-Sent Events (SSE) for streaming responses
-- 🧠 Powered by Cloudflare Workers AI LLMs
-- 🛠️ Built with TypeScript and Cloudflare Workers
-- 📱 Mobile-friendly design
-- 🔄 Maintains chat history on the client
-- 🔎 Built-in Observability logging
-<!-- dash-content-end -->
-
-## Getting Started
-
-### Prerequisites
-
-- [Node.js](https://nodejs.org/) (v18 or newer)
-- [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/install-and-update/)
-- A Cloudflare account with Workers AI access
-
-### Installation
-
-1. Clone this repository:
-
-   ```bash
-   git clone https://github.com/cloudflare/templates.git
-   cd templates/llm-chat-app
-   ```
-
-2. Install dependencies:
-
-   ```bash
-   npm install
-   ```
-
-3. Generate Worker type definitions:
-   ```bash
-   npm run cf-typegen
-   ```
-
-### Development
-
-Start a local development server:
+### 1. 克隆项目
 
 ```bash
-npm run dev
+git clone https://github.com/wwbybhbuhgu/llm-chat-app-template.git
+cd llm-chat-app-template
 ```
 
-This will start a local server at http://localhost:8787.
+### 2. 安装依赖
 
-Note: Using Workers AI accesses your Cloudflare account even during local development, which will incur usage charges.
+```bash
+npm install
+npm run cf-typegen
+```
 
-### Deployment
+### 3. 配置环境变量
 
-Deploy to Cloudflare Workers:
+在 `wrangler.toml` 中配置以下绑定：
+
+```toml
+[[d1_databases]]
+binding = "DB"
+database_name = "your-db-name"
+database_id = "your-db-id"
+
+[[kv_namespaces]]
+binding = "KV_BINDING"
+id = "your-kv-id"
+```
+
+### 4. 创建数据库表
+
+```bash
+wrangler d1 execute your-db-name --file=create-table.sql
+```
+
+`create-table.sql` 内容见下文。
+
+### 5. 部署
 
 ```bash
 npm run deploy
 ```
 
-### Monitor
+## 🗄️ 数据库 Schema
 
-View real-time logs associated with any deployed Worker:
+```sql
+-- 消息表
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL,           -- 'user' or 'assistant'
+    content TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 
-```bash
-npm wrangler tail
+-- 索引优化查询性能
+CREATE INDEX IF NOT EXISTS idx_session_id ON messages(session_id);
 ```
 
-## Project Structure
+## 📁 项目结构
 
 ```
-/
-├── public/             # Static assets
-│   ├── index.html      # Chat UI HTML
-│   └── chat.js         # Chat UI frontend script
-├── src/
-│   ├── index.ts        # Main Worker entry point
-│   └── types.ts        # TypeScript type definitions
-├── test/               # Test files
-├── wrangler.jsonc      # Cloudflare Worker configuration
-├── tsconfig.json       # TypeScript configuration
-└── README.md           # This documentation
+llm-chat-app-template/
+├── public/                  # 静态资源
+│   ├── index.html          # 聊天界面
+│   ├── chat.js             # 前端逻辑
+│   ├── style.css           # 样式
+│   └── vendor/             # 第三方库
+│       ├── marked.min.js   # Markdown 解析
+│       └── dompurify.min.js # XSS 防护
+├── src/                    # 后端代码
+│   └── index.ts            # Worker 主入口
+├── wrangler.jsonc          # Wrangler 配置
+├── package.json
+└── README.md
 ```
 
-## How It Works
+## 🔌 API 接口
 
-### Backend
+| 接口 | 方法 | 描述 |
+|------|------|------|
+| `/api/models` | GET | 获取可用模型列表 |
+| `/api/history?sessionId=xxx` | GET | 获取会话历史记录 |
+| `/api/chat` | POST | 发送消息并流式接收 AI 回复 |
+| `/api/save-ai-reply` | POST | 保存完整的 AI 回复（前端调用） |
 
-The backend is built with Cloudflare Workers and uses the Workers AI platform to generate responses. The main components are:
+## 🎯 核心架构
 
-1. **API Endpoint** (`/api/chat`): Accepts POST requests with chat messages and streams responses
-2. **Streaming**: Uses Server-Sent Events (SSE) for real-time streaming of AI responses
-3. **Workers AI Binding**: Connects to Cloudflare's AI service via the Workers AI binding
+```
+┌─────────────┐         ┌─────────────┐         ┌─────────────┐
+│   前端      │         │   后端      │         │   数据库    │
+│  (chat.js)  │────────▶│ (index.ts)  │────────▶│   (D1)      │
+│             │◀────────│             │◀────────│             │
+│ 维护上下文  │         │ 流式转发    │         │ 存储历史    │
+│ 组装请求    │         │ 异步保存    │         │ 限流统计    │
+└─────────────┘         └─────────────┘         └─────────────┘
+```
 
-### Frontend
+## 🔧 自定义配置
 
-The frontend is a simple HTML/CSS/JavaScript application that:
+### 修改 AI 模型
 
-1. Presents a chat interface
-2. Sends user messages to the API
-3. Processes streaming responses in real-time
-4. Maintains chat history on the client side
+编辑 `src/index.ts` 中的 `MODEL_LIST`:
 
-## Customization
+```typescript
+const MODEL_LIST = [
+  { id: '@cf/meta/llama-3-8b-instruct', name: 'Llama 3 8B Instruct' },
+  // ... 更多模型
+];
+```
 
-### Changing the Model
+### 修改系统提示词
 
-To use a different AI model, update the `MODEL_ID` constant in `src/index.ts`. You can find available models in the [Cloudflare Workers AI documentation](https://developers.cloudflare.com/workers-ai/models/).
+编辑 `src/index.ts` 中的 `SYSTEM_PROMPT`，包含爱国主题过滤策略。
 
-### Using AI Gateway
+### 调整限流设置
 
-The template includes commented code for AI Gateway integration, which provides additional capabilities like rate limiting, caching, and analytics.
+```typescript
+const RATE_LIMIT = 10;     // 每分钟最大请求数
+const RATE_WINDOW = 60;    // 时间窗口（秒）
+```
 
-To enable AI Gateway:
+## 🐛 常见问题
 
-1. [Create an AI Gateway](https://dash.cloudflare.com/?to=/:account/ai/ai-gateway) in your Cloudflare dashboard
-2. Uncomment the gateway configuration in `src/index.ts`
-3. Replace `YOUR_GATEWAY_ID` with your actual AI Gateway ID
-4. Configure other gateway options as needed:
-   - `skipCache`: Set to `true` to bypass gateway caching
-   - `cacheTtl`: Set the cache time-to-live in seconds
+### 1. 流式响应不工作？
 
-Learn more about [AI Gateway](https://developers.cloudflare.com/ai-gateway/).
+确保响应头包含：
+```
+Content-Type: text/event-stream
+Cache-Control: no-cache, no-store, must-revalidate
+Connection: keep-alive
+```
 
-### Modifying the System Prompt
+### 2. 数据库报错？
 
-The default system prompt can be changed by updating the `SYSTEM_PROMPT` constant in `src/index.ts`.
+检查是否已执行建表 SQL，D1 数据库中是否有足够的存储空间。
 
-### Styling
+### 3. 为什么 AI 看不到历史记录？
 
-The UI styling is contained in the `<style>` section of `public/index.html`. You can modify the CSS variables at the top to quickly change the color scheme.
+前端需要正确组装 `context` 参数传给后端 `/api/chat` 接口。
 
-## Resources
+## 📝 变更记录
 
-- [Cloudflare Workers Documentation](https://developers.cloudflare.com/workers/)
-- [Cloudflare Workers AI Documentation](https://developers.cloudflare.com/workers-ai/)
-- [Workers AI Models](https://developers.cloudflare.com/workers-ai/models/)
+### v1.0.0 - 初始版本
+- ✅ 基础聊天功能
+- ✅ 流式响应
+- ✅ 历史记录
+- ✅ 限流保护
+- ✅ 爱国主题过滤
+
+## 📄 许可证
+
+MIT License
