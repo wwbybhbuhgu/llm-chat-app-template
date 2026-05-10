@@ -2,6 +2,7 @@
 let currentSessionId = localStorage.getItem('chat_session_id');
 let isLoading = false;
 let chatHistory = []; // 前端维护的对话历史
+let fullSessionMessages = []; // 完整的会话消息（用于发送上下文）
 
 function generateUUID() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
