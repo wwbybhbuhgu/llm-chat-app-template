@@ -1,6 +1,7 @@
 // 全局变量
 let currentSessionId = localStorage.getItem('chat_session_id');
 let isLoading = false;
+let chatHistory = []; // 前端维护的对话历史
 
 function generateUUID() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
@@ -108,6 +109,19 @@ function appendMessage(role, content, timestamp = null) {
         </div>
     `;
     messagesArea.appendChild(messageDiv);
+    
+    // 添加到前端历史记录
+    if (role === 'user' || role === 'assistant') {
+        chatHistory.push({
+            role: role,
+            content: content
+        });
+        // 限制历史上下文大小（保留最近 30 条消息）
+        if (chatHistory.length > 30) {
+            chatHistory = chatHistory.slice(-30);
+        }
+    }
+    
     scrollToBottom();
 }
 
@@ -117,8 +131,12 @@ async function loadHistory() {
         if (!res.ok) return;
         const { messages } = await res.json();
         if (messages && messages.length > 0) {
-            messagesArea.innerHTML = '';
+            chatHistory = []; // 清空并重建历史记录
             for (const msg of messages) {
+                chatHistory.push({
+                    role: msg.role,
+                    content: msg.content
+                });
                 appendMessage(msg.role, msg.content, msg.created_at);
             }
         } else if (messagesArea.children.length === 0) {
@@ -193,13 +211,15 @@ async function sendMessage() {
     const selectedModel = modelSelect.value;
 
     try {
+        // 发送消息时带上完整的上下文历史
         const response = await fetch('/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 sessionId: currentSessionId,
                 message: message,
-                model: selectedModel
+                model: selectedModel,
+                context: chatHistory // 把前端维护的上下文传给后端
             })
         });
 

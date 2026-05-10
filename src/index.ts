@@ -258,19 +258,27 @@ export default {
         return errorResponse('保存用户消息失败');
       }
 
-      // 2. 获取历史上下文（获取当前用户消息之前的所有对话）
-      let historyRows: Array<{ role: string; content: string }> = [];
-      try {
-        const { results } = await env.DB.prepare(
-          `SELECT role, content FROM messages WHERE session_id = ? AND id < ? ORDER BY ROWID ASC LIMIT ?`
-        ).bind(sessionId, userMsgId!, CONTEXT_LIMIT).all();
-        historyRows = results as any[];
-      } catch (err) {
-        await env.DB.prepare(`DELETE FROM messages WHERE id = ?`).bind(userMsgId!).run();
-        return errorResponse('获取对话上下文失败');
+      // 2. 优先使用前端传来的上下文，否则从数据库获取
+      let aiMessages: Array<{ role: string; content: string }> = [];
+      
+      if (body.context && Array.isArray(body.context)) {
+        // 使用前端传来的上下文
+        console.log(`使用前端上下文，共 ${body.context.length} 条消息`);
+        aiMessages = body.context.map(m => ({ role: m.role, content: m.content }));
+      } else {
+        // 从数据库获取历史上下文（获取当前用户消息之前的所有对话）
+        try {
+          const { results } = await env.DB.prepare(
+            `SELECT role, content FROM messages WHERE session_id = ? AND id < ? ORDER BY ROWID ASC LIMIT ?`
+          ).bind(sessionId, userMsgId!, CONTEXT_LIMIT).all();
+          aiMessages = results as any[];
+        } catch (err) {
+          await env.DB.prepare(`DELETE FROM messages WHERE id = ?`).bind(userMsgId!).run();
+          return errorResponse('获取对话上下文失败');
+        }
       }
 
-      const aiMessages = [{ role: 'system', content: SYSTEM_PROMPT }, ...historyRows];
+      const finalAiMessages = [{ role: 'system', content: SYSTEM_PROMPT }, ...aiMessages];
       const isExternal = EXTERNAL_MODELS.has(selectedModel);
 
       // 3. 获取 AI 流并拼接完整回复（流式收集）
@@ -287,14 +295,14 @@ export default {
             },
             body: JSON.stringify({
               model: selectedModel,
-              messages: aiMessages,
+              messages: finalAiMessages,
               stream: true,
             }),
           });
           if (!resp.ok) throw new Error(`External API error ${resp.status}`);
           tokenGen = externalAITokenStream(resp.body!);
         } else {
-          const aiStream = await env.AI.run(selectedModel, { messages: aiMessages, stream: true }) as ReadableStream;
+          const aiStream = await env.AI.run(selectedModel, { messages: finalAiMessages, stream: true }) as ReadableStream;
           tokenGen = workersAITokenStream(aiStream);
         }
       } catch (err: any) {
