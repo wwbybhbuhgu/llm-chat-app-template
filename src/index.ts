@@ -42,14 +42,10 @@ const KV_TTL_BUFFER = 5;
 const CREATE_TABLE_SQL = "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)";
 const CREATE_INDEX_SQL = "CREATE INDEX IF NOT EXISTS idx_session_id ON messages(session_id)";
 
-// 全局标志，确保 ensureTable 只执行一次
-let tableInited = false;
-
 async function ensureTable(db: D1Database) {
-  if (tableInited) return;
-  await db.exec(CREATE_TABLE_SQL);
-  await db.exec(CREATE_INDEX_SQL);
-  tableInited = true;
+  // 每次调用都执行，D1 会忽略已存在的表
+  await db.exec(CREATE_TABLE_SQL).catch(err => console.error('建表失败:', err));
+  await db.exec(CREATE_INDEX_SQL).catch(err => console.error('建索引失败:', err));
 }
 
 function isValidSessionId(id: string): boolean {
@@ -263,12 +259,12 @@ export default {
         return errorResponse('保存用户消息失败');
       }
 
-      // 2. 获取历史上下文（只取已完整保存的消息，不包括当前未完成的 AI 回复）
+      // 2. 获取历史上下文（获取当前用户消息之前的所有对话）
       let historyRows: Array<{ role: string; content: string }> = [];
       try {
         const { results } = await env.DB.prepare(
-          `SELECT role, content FROM messages WHERE session_id = ? ORDER BY created_at ASC LIMIT ?`
-        ).bind(sessionId, CONTEXT_LIMIT).all();
+          `SELECT role, content FROM messages WHERE session_id = ? AND id < ? ORDER BY ROWID ASC LIMIT ?`
+        ).bind(sessionId, userMsgId!, CONTEXT_LIMIT).all();
         historyRows = results as any[];
       } catch (err) {
         await env.DB.prepare(`DELETE FROM messages WHERE id = ?`).bind(userMsgId!).run();
@@ -327,23 +323,18 @@ export default {
         },
       });
 
-      // 5. 流结束后，同步保存助手回复（不用 waitUntil，确保入库完成再返回？不行，因为 SSE 已经返回了）
-      // 但可以在后台异步执行，但为了时序，改用 waitUntil 并让前端等待一小会儿？前端已有延迟处理，我们保留 waitUntil。
-      // 注意：此时 SSE 流已经开始推送，不能阻塞响应。我们使用 ctx.waitUntil 异步保存，前端收到 [DONE] 后延迟 500ms 再拉历史，可以解决。
-      const saveAssistantReply = async () => {
-        const finalReply = fullReply || '抱歉，我无法生成回答。';
-        try {
-          await env.DB.prepare(`INSERT INTO messages (session_id, role, content) VALUES (?, 'assistant', ?)`)
-            .bind(sessionId, finalReply).run();
-          await updateSessionStats(env.KV_BINDING, sessionId);
-          console.log(`已保存助手消息，长度 ${finalReply.length}`);
-        } catch (err) {
-          console.error('保存助手回复失败', err);
-        }
-      };
-      ctx.waitUntil(saveAssistantReply());
+      // 5. 流结束后同步保存助手回复
+      const finalReply = fullReply || '抱歉，我无法生成回答。';
+      try {
+        await env.DB.prepare(`INSERT INTO messages (session_id, role, content) VALUES (?, 'assistant', ?)`)
+          .bind(sessionId, finalReply).run();
+        await updateSessionStats(env.KV_BINDING, sessionId);
+        console.log(`已保存助手消息，长度 ${finalReply.length}`);
+      } catch (err) {
+        console.error('保存助手回复失败', err);
+      }
 
-      // 返回 SSE 响应
+      // 返回 SSE 响应（流已完成推送）
       return new Response(sseStream, {
         headers: {
           'Content-Type': 'text/event-stream',
